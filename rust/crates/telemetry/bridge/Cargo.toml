@@ -1,0 +1,18 @@
+[package]
+name = "duckdb-telemetry-bridge"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "duckdb_telemetry_bridge"
+crate-type = ["staticlib"]
+
+[dependencies]
+cxx.workspace = true
+duckdb-telemetry-model = { path = "../model" }
+
+[build-dependencies]
+cxx-build.workspace = true
+duckdb-telemetry-model = { path = "../model" }
+quent-codegen = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+

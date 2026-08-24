@@ -57,6 +57,7 @@ add_library_unity(
   query_result.cpp
   result_set_manager.cpp
   stream_query_result.cpp
+  telemetry_context.cpp
   user_settings.cpp
   valid_checker.cpp)
 set(ALL_OBJECT_FILES

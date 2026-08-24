@@ -1,6 +1,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/common/arrow/arrow_type_extension.hpp"
 #include "duckdb/main/profiler/metrics_manager.hpp"
+#include "duckdb/main/telemetry_context.hpp"
 #include "duckdb/parser/peg/compiled_grammar.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -302,6 +303,7 @@ void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_conf
 	}
 
 	Configure(*config_ptr, database_path);
+	telemetry_context = make_uniq<TelemetryContext>(config);
 	// publish what this binary links, unless the config already carries a set handed to us
 	ExtensionHelper::RegisterLinkedExtensions(config);
 

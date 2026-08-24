@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/winapi.hpp"
 #include "duckdb/main/capi/extension_api.hpp"
 #include "duckdb/main/config.hpp"
@@ -40,9 +41,11 @@ class MetricsManager;
 class ExternalFileCache;
 class ResultSetManager;
 struct ParserCache;
+class TelemetryContext;
 
 class DatabaseInstance : public enable_shared_from_this<DatabaseInstance> {
 	friend class DuckDB;
+	friend class ClientContext;
 
 public:
 	DUCKDB_API DatabaseInstance();
@@ -112,6 +115,8 @@ private:
 	unique_ptr<ExternalFileCache> external_file_cache;
 	unique_ptr<ResultSetManager> result_set_manager;
 	unique_ptr<ParserCache> parser_cache;
+
+	unique_ptr<TelemetryContext> telemetry_context;
 
 	duckdb_ext_api_v1 (*create_api_v1)();
 };

@@ -1,6 +1,8 @@
 CompileFlags:
   CompilationDatabase: .cache/clangd
-  Add: -Wno-unqualified-std-cast-call
+  Add:
+    - -Wno-unqualified-std-cast-call
+    - -I/home/dvats/repos/duckdb/rust/crates/telemetry/bridge/include
 
 # Keep this list in sync with tidy-check-diff exclusions in the Makefile.
 ---

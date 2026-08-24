@@ -1,0 +1,20 @@
+[package]
+name = "duckdb-telemetry-server"
+version.workspace = true
+edition.workspace = true
+
+[features]
+ui = ["quent-query-engine-server/ui"]
+swagger = ["quent-query-engine-server/swagger"]
+
+[dependencies]
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+duckdb-telemetry-analyzer = { path = "../analyzer" }
+duckdb-telemetry-model = { path = "../model", features = ["collector"] }
+quent-collector = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+quent-query-engine-server = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+tracing = "0.1"
+uuid = "1"
