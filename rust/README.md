@@ -5,7 +5,13 @@ instrumentation bridge, analyzes captured events, and serves them to the Quent
 UI. It mirrors the corresponding workspace in Sirius and is wired into DuckDB
 through the `BUILD_QUENT_TELEMETRY` CMake option.
 
-The model contains the standard query-engine entities plus three DuckDB runtime
+See [INSTRUMENTATION.md](INSTRUMENTATION.md) for entity semantics, design
+reasoning, analyzer guarantees, limitations, and future candidates.
+
+See [QUERY_COOKBOOK.md](QUERY_COOKBOOK.md) for copy-paste generated-data and
+TPC-H captures that exercise each UI timeline and overlay.
+
+The model contains the standard query-engine entities plus four DuckDB runtime
 FSMs:
 
 - `pipeline_task` follows one scheduled pipeline task through running, partial
@@ -14,6 +20,8 @@ FSMs:
   edge, including its task, operator and port IDs, rows, and logical bytes.
 - `operator_invocation` measures one source, execute, final-execute, or sink
   call, including its task, physical operator, row counts, and logical bytes.
+- `temporary_block_io` measures one buffer-manager spill or reload, including
+  its causal query, task, operator, memory tag, buffer bytes, and stored bytes.
 
 Pipeline tasks use the worker's `task_queue` while queued or ready, and both
 tasks and operator invocations use the stable `execution_thread` on which they
@@ -71,8 +79,9 @@ events_dir=$(mktemp -d)
 QUENT_EXPORTER=ndjson QUENT_OUTPUT_DIR="$events_dir" \
     build/reldebug/duckdb -c \
     "SET threads=4;
-     SET scheduler_process_partial=true;
-     SELECT sum(i * i) FROM range(1000000) t(i) WHERE i % 7 = 0;"
+     CREATE TABLE scan_data AS
+       SELECT i::BIGINT AS i FROM range(5000000) t(i);
+     SELECT sum(i * i) FROM scan_data WHERE i % 7 = 0;"
 ```
 
 Then serve the completed event stream and open `http://127.0.0.1:8080`:
@@ -104,10 +113,18 @@ worker:
 - `thread-*` with `pipeline_task` shows scheduled task execution (`Running`).
 - `thread-*` with `operator_invocation` shows physical-operator calls
   (`Running`). Selecting plan operators filters these timelines.
+- `temporary-spill` and `temporary-reload` with `temporary_block_io` show
+  temporary-storage operation and buffer-byte rates.
 
 The execution-thread lanes represent OS threads, not CPU cores. A task may use
 different lanes after yielding. `Blocked` carries no resource usage because a
 blocked task is neither runnable nor executing.
+
+`SET threads=4` is an upper bound. The `range()` table function is forced
+single-threaded, so a query reading it directly can use one lane. The stored
+table scan above creates several tasks and can use four lanes. Selecting an
+operator highlights tasks whose pipeline contains it; select
+`operator_invocation` for exact operator time.
 
 The query-plan view also shows a data-flow overlay derived from
 `chunk_transfer` publications. It provides per-operator publication rates for
@@ -146,5 +163,31 @@ curl -s -X POST \
 The query bundle advertises all runtime FSM declarations. Runtime instances
 are available through `POST /api/engines/{engine_id}/entities` with
 `filter.entity_type_name` set to `pipeline_task`, `chunk_transfer`, or
-`operator_invocation`. The analyzer also exposes
+`operator_invocation`, or `temporary_block_io`. The analyzer also exposes
 `DuckDbUiAnalyzer::chunk_summary(query_id)` for totals by physical-plan edge.
+
+## Capture temporary I/O
+
+This external hash join emits spill and reload operations:
+
+```bash
+events_dir=$(mktemp -d)
+spill_dir=$(mktemp -d)
+QUENT_EXPORTER=ndjson QUENT_OUTPUT_DIR="$events_dir" \
+    build/reldebug/duckdb -c \
+    "SET threads=4;
+     SET memory_limit='128MB';
+     SET temp_directory='$spill_dir';
+     SET preserve_insertion_order=false;
+     SET debug_force_external=true;
+     SELECT count(*)
+     FROM range(10000000) a(i)
+     JOIN range(10000000) b(i) USING (i);"
+```
+
+`buffer_bytes` is the page-aligned in-memory buffer size. `storage_bytes` is
+the temporary representation size. Timeline rates measure synchronous
+buffer-manager service, including compression, encryption, locks, and file
+work; they are not device bandwidth. Spill attribution names the operator that
+caused eviction, not the evicted block's owner. Custom buffer managers bypass
+this probe.

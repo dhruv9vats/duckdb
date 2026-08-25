@@ -317,7 +317,8 @@ void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_conf
 	if (config.buffer_manager) {
 		buffer_manager = config.buffer_manager;
 	} else {
-		buffer_manager = make_uniq<StandardBufferManager>(*this, config.options.temporary_directory);
+		buffer_manager = make_uniq<StandardBufferManager>(*this, config.options.temporary_directory,
+		                                                  telemetry_context->TempIoProbe());
 	}
 
 	log_manager = make_uniq<LogManager>(*this, LogConfig());

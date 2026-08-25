@@ -124,6 +124,13 @@ impl PipelineTaskExt for PipelineTask {
     }
 }
 
+pub(crate) fn task_plan_id(task: &PipelineTask) -> Option<Uuid> {
+    task.first_data().and_then(|transition| match transition {
+        PipelineTaskTransition::Created(created) => Some(created.plan_id),
+        _ => None,
+    })
+}
+
 fn resource_matches(
     resources: &InMemoryResources,
     resource_id: Uuid,

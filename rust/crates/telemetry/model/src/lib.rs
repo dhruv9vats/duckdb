@@ -4,6 +4,7 @@ pub mod chunk_transfer;
 pub mod operator_invocation;
 pub mod pipeline_task;
 pub mod runtime_resource;
+pub mod temporary_block_io;
 
 model! {
     name: DuckDB,
@@ -18,8 +19,10 @@ model! {
         pipeline_task::PipelineTask,
         chunk_transfer::ChunkTransfer,
         operator_invocation::OperatorInvocation,
+        temporary_block_io::TemporaryBlockIo,
         runtime_resource::ExecutionThread,
         runtime_resource::TaskQueue,
+        runtime_resource::TemporaryIoChannel,
     },
     analyzer: "duckdb-telemetry-analyzer",
 }

@@ -11,3 +11,15 @@ resource! {
         capacity: { entries: Option<u64> },
     }
 }
+
+resource! {
+    /// Temporary-storage I/O issued by DuckDB's buffer manager.
+    TemporaryIoChannel {
+        capacity: {
+            rate,
+            operations: Option<u64>,
+            // Page-aligned FileBuffer bytes transferred.
+            buffer_bytes: Option<u64>,
+        },
+    }
+}

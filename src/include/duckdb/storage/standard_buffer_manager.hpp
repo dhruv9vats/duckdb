@@ -15,6 +15,7 @@
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/storage/buffer/block_handle.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
+#include "duckdb/storage/temporary_io_probe.hpp"
 
 namespace duckdb {
 
@@ -36,6 +37,7 @@ class StandardBufferManager : public BufferManager {
 
 public:
 	StandardBufferManager(DatabaseInstance &db, string temp_directory);
+	StandardBufferManager(DatabaseInstance &db, string temp_directory, shared_ptr<TemporaryIoProbe> temporary_io_probe);
 	~StandardBufferManager() override;
 
 public:
@@ -212,6 +214,12 @@ protected:
 	unique_ptr<BlockManager> temp_block_manager;
 	//! Temporary evicted memory data per tag
 	atomic<CheckedInteger<idx_t, InternalException>> evicted_data_per_tag[MEMORY_TAG_COUNT];
+
+private:
+	unique_ptr<TemporaryIoEvent> StartTempIo(QueryContext context, TemporaryIoDirection direction, block_id_t block_id,
+	                                         MemoryTag tag, idx_t buffer_bytes);
+
+	shared_ptr<TemporaryIoProbe> temporary_io_probe;
 };
 
 } // namespace duckdb

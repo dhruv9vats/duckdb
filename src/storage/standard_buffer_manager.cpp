@@ -70,14 +70,35 @@ void StandardBufferManager::SetTemporaryDirectory(const string &new_dir) {
 }
 
 StandardBufferManager::StandardBufferManager(DatabaseInstance &db, string tmp)
+    : StandardBufferManager(db, std::move(tmp), nullptr) {
+}
+
+StandardBufferManager::StandardBufferManager(DatabaseInstance &db, string tmp,
+                                             shared_ptr<TemporaryIoProbe> temporary_io_probe_p)
     : BufferManager(), db(db), buffer_pool(db.GetBufferPool()), temporary_id(MAXIMUM_BLOCK),
       buffer_allocator(BufferAllocatorAllocate, BufferAllocatorFree, BufferAllocatorRealloc,
-                       make_uniq<BufferAllocatorData>(*this)) {
+                       make_uniq<BufferAllocatorData>(*this)),
+      temporary_io_probe(std::move(temporary_io_probe_p)) {
 	temp_block_manager =
 	    make_uniq<InMemoryBlockManager>(*this, DEFAULT_BLOCK_ALLOC_SIZE, DEFAULT_BLOCK_HEADER_STORAGE_SIZE);
 	temporary_directory.path = std::move(tmp);
 	for (idx_t i = 0; i < MEMORY_TAG_COUNT; i++) {
 		evicted_data_per_tag[i] = 0;
+	}
+}
+
+unique_ptr<TemporaryIoEvent> StandardBufferManager::StartTempIo(QueryContext context, TemporaryIoDirection direction,
+                                                                block_id_t block_id, MemoryTag tag,
+                                                                idx_t buffer_bytes) {
+	if (!temporary_io_probe) {
+		return nullptr;
+	}
+
+	try {
+		return temporary_io_probe->Start(
+		    {context, direction, NumericCast<uint64_t>(block_id), tag, NumericCast<uint64_t>(buffer_bytes)});
+	} catch (...) {
+		return nullptr;
 	}
 }
 
@@ -501,6 +522,8 @@ bool StandardBufferManager::EncryptTemporaryFiles() {
 
 void StandardBufferManager::WriteTemporaryBuffer(QueryContext context, MemoryTag tag, block_id_t block_id,
                                                  FileBuffer &buffer) {
+	auto telemetry = StartTempIo(context, TemporaryIoDirection::SPILL, block_id, tag, buffer.AllocSize());
+
 	// WriteTemporaryBuffer assumes that we never write a buffer below DEFAULT_BLOCK_ALLOC_SIZE.
 	RequireTemporaryDirectory();
 
@@ -508,6 +531,9 @@ void StandardBufferManager::WriteTemporaryBuffer(QueryContext context, MemoryTag
 	if (buffer.AllocSize() == GetBlockAllocSize()) {
 		idx_t eviction_size = temporary_directory.handle->GetTempFile().WriteTemporaryBuffer(context, block_id, buffer);
 		evicted_data_per_tag[uint8_t(tag)] += eviction_size;
+		if (telemetry) {
+			telemetry->Complete(eviction_size);
+		}
 		return;
 	}
 
@@ -543,6 +569,9 @@ void StandardBufferManager::WriteTemporaryBuffer(QueryContext context, MemoryTag
 	}
 
 	buffer.Write(context, *handle, offset);
+	if (telemetry) {
+		telemetry->Complete(buffer.AllocSize() + header_size);
+	}
 }
 
 unique_ptr<FileBuffer> StandardBufferManager::ReadTemporaryBuffer(QueryContext context, MemoryTag tag,
@@ -550,6 +579,7 @@ unique_ptr<FileBuffer> StandardBufferManager::ReadTemporaryBuffer(QueryContext c
                                                                   unique_ptr<FileBuffer> reusable_buffer) {
 	D_ASSERT(!temporary_directory.path.empty());
 	auto id = block.BlockId();
+	auto telemetry = StartTempIo(context, TemporaryIoDirection::RELOAD, id, tag, block.GetMemory().GetMemoryUsage());
 	if (!temporary_directory.handle) {
 		throw InternalException("ReadTemporaryBuffer called but temporary directory has not been instantiated yet");
 	}
@@ -563,6 +593,9 @@ unique_ptr<FileBuffer> StandardBufferManager::ReadTemporaryBuffer(QueryContext c
 		// Decrement evicted size.
 		evicted_data_per_tag[uint8_t(tag)] -= eviction_size;
 
+		if (telemetry) {
+			telemetry->Complete(eviction_size);
+		}
 		return buffer;
 	}
 
@@ -572,6 +605,7 @@ unique_ptr<FileBuffer> StandardBufferManager::ReadTemporaryBuffer(QueryContext c
 	auto path = GetTemporaryPath(id);
 	auto &fs = FileSystem::GetFileSystem(db);
 	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+	auto storage_bytes = handle->GetFileSize();
 	handle->Read(context, &block_size, sizeof(idx_t), 0);
 	handle->Read(context, &block_header_size, sizeof(idx_t), sizeof(idx_t));
 
@@ -602,6 +636,9 @@ unique_ptr<FileBuffer> StandardBufferManager::ReadTemporaryBuffer(QueryContext c
 	// decrement again here or the counter underflows on every read-back.
 	DeleteTemporaryFile(block.GetMemory());
 
+	if (telemetry) {
+		telemetry->Complete(storage_bytes);
+	}
 	return buffer;
 }
 

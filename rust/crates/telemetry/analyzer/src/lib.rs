@@ -44,23 +44,29 @@ use uuid::Uuid;
 
 use crate::{
     chunk_transfer::{ChunkTransfer, ChunkTransferExt},
-    model::{DuckDbModel, DuckDbModelBuilder},
+    model::{
+        DuckDbModel, DuckDbModelBuilder, IO_BUFFER_BYTES_CAPACITY_NAME, IO_OPERATIONS_CAPACITY_NAME,
+    },
     operator_invocation::{OperatorInvocation, OperatorInvocationExt},
-    pipeline_task::{PipelineTask, PipelineTaskExt},
+    pipeline_task::{PipelineTask, PipelineTaskExt, task_plan_id},
+    temporary_block_io::{TemporaryBlockIo, TemporaryBlockIoExt},
 };
 
 pub mod chunk_transfer;
 pub mod model;
 pub mod operator_invocation;
 pub mod pipeline_task;
+mod temporary_block_io;
 
 const PIPELINE_TASK_TYPE_NAME: &str = "pipeline_task";
 const CHUNK_TRANSFER_TYPE_NAME: &str = "chunk_transfer";
 const OPERATOR_INVOCATION_TYPE_NAME: &str = "operator_invocation";
+const TEMPORARY_BLOCK_IO_TYPE_NAME: &str = "temporary_block_io";
 const MEASURE_CHUNKS: &str = "chunks";
 const MEASURE_ROWS: &str = "rows";
 const MEASURE_LOGICAL_BYTES: &str = "logical_bytes";
 const DATA_FLOW_STATE: &str = "published";
+const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
 
 /// `quent-open` entry point for DuckDB telemetry directories.
 pub struct Viewer;
@@ -110,6 +116,16 @@ impl FsmCollection for OperatorInvocationCollection<'_> {
     }
 }
 
+struct TemporaryBlockIoCollection<'a>(&'a std::collections::HashMap<Uuid, TemporaryBlockIo>);
+
+impl FsmCollection for TemporaryBlockIoCollection<'_> {
+    type Fsm = TemporaryBlockIo;
+
+    fn fsms(&self) -> impl Iterator<Item = &TemporaryBlockIo> {
+        self.0.values()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkEdgeSummary {
     pub source_operator_id: Uuid,
@@ -127,6 +143,17 @@ struct QueryTopology {
     operator_plans: HashMap<Uuid, Uuid>,
     port_operators: HashMap<Uuid, Uuid>,
     plan_edges: HashSet<(Uuid, Uuid)>,
+}
+
+struct QueryTasks {
+    operators: HashMap<Uuid, HashSet<Uuid>>,
+    plans: HashMap<Uuid, Uuid>,
+}
+
+#[derive(Clone, Copy)]
+enum RateScale {
+    Native,
+    PerSecond,
 }
 
 impl UiAnalyzer for DuckDbUiAnalyzer {
@@ -152,6 +179,7 @@ impl UiAnalyzer for DuckDbUiAnalyzer {
             pipeline_tasks = model.pipeline_tasks.len(),
             chunk_transfers = model.chunk_transfers.len(),
             operator_invocations = model.operator_invocations.len(),
+            temporary_block_ios = model.temporary_block_ios.len(),
             resources = model.runtime_resources.resources.len(),
             "built DuckDB query-engine model"
         );
@@ -194,10 +222,12 @@ impl UiAnalyzer for DuckDbUiAnalyzer {
         let task_decl = PipelineTask::fsm_type_declaration();
         let transfer_decl = ChunkTransfer::fsm_type_declaration();
         let invocation_decl = OperatorInvocation::fsm_type_declaration();
+        let temporary_io_decl = TemporaryBlockIo::fsm_type_declaration();
         let fsm_types = [
             (task_decl.name.clone(), task_decl),
             (transfer_decl.name.clone(), transfer_decl),
             (invocation_decl.name.clone(), invocation_decl),
+            (temporary_io_decl.name.clone(), temporary_io_decl),
         ]
         .into_iter()
         .collect();
@@ -291,6 +321,20 @@ impl UiAnalyzer for DuckDbUiAnalyzer {
                     },
                 ),
                 (MEASURE_LOGICAL_BYTES.to_owned(), QuantitySpec::bytes()),
+                (
+                    IO_OPERATIONS_CAPACITY_NAME.to_owned(),
+                    QuantitySpec {
+                        symbol: String::new(),
+                        singular: "operation".to_owned(),
+                        plural: "operations".to_owned(),
+                        occupancy_prefix: PrefixSystem::None,
+                        rate_prefix: PrefixSystem::Si,
+                    },
+                ),
+                (
+                    IO_BUFFER_BYTES_CAPACITY_NAME.to_owned(),
+                    QuantitySpec::bytes(),
+                ),
             ]
             .into(),
             start_time_unix_ns: epoch,
@@ -316,8 +360,8 @@ impl UiAnalyzer for DuckDbUiAnalyzer {
         let query_id = request.app_params.query_id;
         let epoch = self.model.query_epoch(query_id)?;
         let topology = self.query_topology(query_id)?;
-        let task_operators = self.query_tasks(query_id, &topology);
-        let task_ids = task_operators.keys().copied().collect();
+        let tasks = self.query_tasks(query_id, &topology);
+        let task_ids = tasks.operators.keys().copied().collect();
         let entry = request.entry;
         let window = entry.window.try_into_span(epoch)?;
         let scope = entry
@@ -377,7 +421,7 @@ impl UiAnalyzer for DuckDbUiAnalyzer {
                             &topology.operator_plans,
                             &topology.plan_workers,
                             &topology.plan_ids,
-                            &task_operators,
+                            &tasks.operators,
                         )
                         && invocation.resources_are_valid(
                             &topology.plan_workers,
@@ -385,6 +429,14 @@ impl UiAnalyzer for DuckDbUiAnalyzer {
                         )
                         && invocation.matches_operator(&filter)
                         && invocation.span().is_ok_and(|span| span.intersects(&window))
+                },
+                query,
+            ),
+            Some(TEMPORARY_BLOCK_IO_TYPE_NAME) => entities::list_entities(
+                &TemporaryBlockIoCollection(&self.model.temporary_block_ios),
+                |io| {
+                    self.temporary_io_matches(io, query_id, &topology, &tasks, &filter)
+                        && io.span().is_ok_and(|span| span.intersects(&window))
                 },
                 query,
             ),
@@ -416,6 +468,7 @@ impl UiAnalyzer for DuckDbUiAnalyzer {
         let topology = self.query_topology(query_id)?;
         let task_ids = self
             .query_tasks(query_id, &topology)
+            .operators
             .into_keys()
             .collect::<HashSet<_>>();
         let operator_names = self
@@ -564,7 +617,7 @@ impl DuckDbUiAnalyzer {
         let query_id = request.app_params.query_id;
         let epoch = self.model.query_epoch(query_id)?;
         let topology = self.query_topology(query_id)?;
-        let task_operators = self.query_tasks(query_id, &topology);
+        let tasks = self.query_tasks(query_id, &topology);
         let config = request.entry.config().try_into_binned_span(epoch)?;
         let config_secs = config.try_to_secs_relative(epoch)?;
 
@@ -623,6 +676,11 @@ impl DuckDbUiAnalyzer {
                     )
                 }
             };
+        let rate_scale = if resource_type.name == crate::model::TEMPORARY_IO_CHANNEL_TYPE_NAME {
+            RateScale::PerSecond
+        } else {
+            RateScale::Native
+        };
 
         let data = if let Some(entity_type) = entity_filter.entity_type_name.as_deref() {
             let mut builder =
@@ -649,12 +707,23 @@ impl DuckDbUiAnalyzer {
                                     invocation,
                                     query_id,
                                     &topology,
-                                    &task_operators,
+                                    &tasks.operators,
                                     &operator_filter,
                                 )
                             })
                     {
                         for (state, usage) in invocation.usages_with_state_names() {
+                            if resource_ids.contains(&usage.resource_id()) {
+                                builder.try_push(state, &usage)?;
+                            }
+                        }
+                    }
+                }
+                TEMPORARY_BLOCK_IO_TYPE_NAME => {
+                    for io in self.model.temporary_block_ios.values().filter(|io| {
+                        self.temporary_io_matches(io, query_id, &topology, &tasks, &operator_filter)
+                    }) {
+                        for (state, usage) in io.usages_with_state_names() {
                             if resource_ids.contains(&usage.resource_id()) {
                                 builder.try_push(state, &usage)?;
                             }
@@ -669,7 +738,7 @@ impl DuckDbUiAnalyzer {
                     )));
                 }
             }
-            self.timeline_to_ui_keyed(builder.build(), epoch)?
+            self.timeline_to_ui_keyed(builder.build(), epoch, rate_scale)?
         } else {
             let mut builder = ResourceTimelineBuilder::try_new(resource_type, config, threshold)?;
             // Task and invocation usages are nested on execution threads. Use the
@@ -687,7 +756,16 @@ impl DuckDbUiAnalyzer {
                     }
                 }
             }
-            self.timeline_to_ui(builder.build(), epoch)?
+            for io in self.model.temporary_block_ios.values().filter(|io| {
+                self.temporary_io_matches(io, query_id, &topology, &tasks, &operator_filter)
+            }) {
+                for usage in io.usages() {
+                    if resource_ids.contains(&usage.resource_id()) {
+                        builder.try_push(&usage)?;
+                    }
+                }
+            }
+            self.timeline_to_ui(builder.build(), epoch, rate_scale)?
         };
 
         Ok(SingleTimelineResponse {
@@ -696,12 +774,9 @@ impl DuckDbUiAnalyzer {
         })
     }
 
-    fn query_tasks(
-        &self,
-        query_id: Uuid,
-        topology: &QueryTopology,
-    ) -> HashMap<Uuid, HashSet<Uuid>> {
-        self.model
+    fn query_tasks(&self, query_id: Uuid, topology: &QueryTopology) -> QueryTasks {
+        let operators = self
+            .model
             .pipeline_tasks
             .iter()
             .filter(|(_, task)| {
@@ -718,7 +793,19 @@ impl DuckDbUiAnalyzer {
                 task.operator_ids()
                     .map(|operator_ids| (*id, operator_ids.iter().copied().collect()))
             })
-            .collect()
+            .collect::<HashMap<_, _>>();
+        let plans = operators
+            .keys()
+            .filter_map(|id| {
+                self.model
+                    .pipeline_tasks
+                    .get(id)
+                    .and_then(task_plan_id)
+                    .map(|plan_id| (*id, plan_id))
+            })
+            .collect();
+
+        QueryTasks { operators, plans }
     }
 
     fn task_matches(
@@ -759,6 +846,27 @@ impl DuckDbUiAnalyzer {
             && invocation.matches_operator(filter)
     }
 
+    fn temporary_io_matches(
+        &self,
+        io: &TemporaryBlockIo,
+        query_id: Uuid,
+        topology: &QueryTopology,
+        tasks: &QueryTasks,
+        filter: &OperatorFilter,
+    ) -> bool {
+        io.query_id() == Some(query_id)
+            && io.is_complete()
+            && io.belongs_to_query(
+                &topology.operator_plans,
+                &topology.plan_workers,
+                &topology.plan_ids,
+                &tasks.plans,
+                &tasks.operators,
+            )
+            && io.resources_are_valid(&topology.plan_workers, &self.model.runtime_resources)
+            && io.matches_operator(filter)
+    }
+
     fn entities_to_ui(
         &self,
         entity_ids: &[Uuid],
@@ -769,6 +877,9 @@ impl DuckDbUiAnalyzer {
             .filter_map(|id| {
                 if let Some(task) = self.model.pipeline_tasks.get(id) {
                     return Some(FiniteStateMachine::try_from_fsm(task, epoch));
+                }
+                if let Some(io) = self.model.temporary_block_ios.get(id) {
+                    return Some(FiniteStateMachine::try_from_fsm(io, epoch));
                 }
                 self.model
                     .operator_invocations
@@ -783,13 +894,17 @@ impl DuckDbUiAnalyzer {
         &self,
         timeline: ResourceTimeline<'_>,
         epoch: TimeUnixNanoSec,
+        rate_scale: RateScale,
     ) -> AnalyzerResult<UiResourceTimeline> {
         Ok(UiResourceTimeline::Binned(ResourceTimelineBinned {
             config: timeline.config.try_to_secs_relative(epoch)?,
             capacities_values: timeline
                 .data
                 .into_iter()
-                .map(|(name, values)| (name.to_owned(), values))
+                .map(|(name, mut values)| {
+                    normalize_rate(rate_scale, name, &mut values);
+                    (name.to_owned(), values)
+                })
                 .collect(),
             long_fsms: self.entities_to_ui(&timeline.long_entities, epoch)?,
         }))
@@ -799,9 +914,11 @@ impl DuckDbUiAnalyzer {
         &self,
         timeline: ResourceTimelineByKey<'_, &str>,
         epoch: TimeUnixNanoSec,
+        rate_scale: RateScale,
     ) -> AnalyzerResult<UiResourceTimeline> {
         let mut capacities_states_values = HashMap::new();
-        for ((state, capacity), values) in timeline.data {
+        for ((state, capacity), mut values) in timeline.data {
+            normalize_rate(rate_scale, capacity, &mut values);
             capacities_states_values
                 .entry(capacity.to_owned())
                 .or_insert_with(HashMap::new)
@@ -859,7 +976,11 @@ impl DuckDbUiAnalyzer {
         let Ok(topology) = self.query_topology(query_id) else {
             return vec![];
         };
-        let task_ids: HashSet<Uuid> = self.query_tasks(query_id, &topology).into_keys().collect();
+        let task_ids: HashSet<Uuid> = self
+            .query_tasks(query_id, &topology)
+            .operators
+            .into_keys()
+            .collect();
         let mut grouped = BTreeMap::<Edge, Totals>::new();
         for transfer in self.model.chunk_transfers.values() {
             if transfer.query_id() != Some(query_id)
@@ -907,14 +1028,31 @@ impl DuckDbUiAnalyzer {
     }
 }
 
+fn normalize_rate(rate_scale: RateScale, capacity: &str, values: &mut [f64]) {
+    if !matches!(rate_scale, RateScale::PerSecond)
+        || !matches!(
+            capacity,
+            IO_OPERATIONS_CAPACITY_NAME | IO_BUFFER_BYTES_CAPACITY_NAME
+        )
+    {
+        return;
+    }
+
+    // Quent computes per-nanosecond rates; the UI displays per second.
+    for value in values {
+        *value *= NANOS_PER_SECOND;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::model::{
         EXECUTION_THREAD_TYPE_NAME, QUEUE_ENTRIES_CAPACITY_NAME, TASK_QUEUE_TYPE_NAME,
+        TEMPORARY_IO_CHANNEL_TYPE_NAME,
     };
     use duckdb_telemetry_model::{
         chunk_transfer, engine, operator, operator_invocation, pipeline_task, plan, port, query,
-        query_group, runtime_resource, worker,
+        query_group, runtime_resource, temporary_block_io, worker,
     };
     use quent_model::{Capacity, FsmEvent, Ref, Usage};
     use quent_ui::entities::request::{
@@ -949,6 +1087,11 @@ mod tests {
     const INVALID_RESOURCE_TASK_ID: Uuid = Uuid::from_u128(22);
     const INVALID_INVOCATION_ID: Uuid = Uuid::from_u128(23);
     const UNKNOWN_WORKER_ID: Uuid = Uuid::from_u128(24);
+    const TEMPORARY_IO_CHANNEL_ID: Uuid = Uuid::from_u128(25);
+    const TEMPORARY_IO_ID: Uuid = Uuid::from_u128(26);
+    const INVALID_TEMPORARY_IO_ID: Uuid = Uuid::from_u128(27);
+    const NIL_TEMPORARY_IO_ID: Uuid = Uuid::from_u128(28);
+    const ONE_SECOND_NS: u64 = 1_000_000_000;
 
     fn event(id: Uuid, timestamp: u64, data: DuckDBEvent) -> Event<DuckDBEvent> {
         Event::new(id, timestamp, data)
@@ -975,6 +1118,19 @@ mod tests {
         Usage {
             resource_id: Ref::new(id),
             capacity: runtime_resource::ExecutionThreadOperating {},
+        }
+    }
+
+    fn temporary_io_usage(
+        operations: u64,
+        buffer_bytes: u64,
+    ) -> Usage<runtime_resource::TemporaryIoChannel> {
+        Usage {
+            resource_id: Ref::new(TEMPORARY_IO_CHANNEL_ID),
+            capacity: runtime_resource::TemporaryIoChannelOperating {
+                capacity_operations: Capacity::new(Some(operations)),
+                capacity_buffer_bytes: Capacity::new(Some(buffer_bytes)),
+            },
         }
     }
 
@@ -1073,6 +1229,56 @@ mod tests {
             ),
         ]);
         events
+    }
+
+    fn temporary_io_channel_events(parent_id: Uuid) -> Vec<Event<DuckDBEvent>> {
+        vec![
+            event(
+                TEMPORARY_IO_CHANNEL_ID,
+                110,
+                DuckDBEvent::TemporaryIoChannel(fsm(
+                    0,
+                    runtime_resource::TemporaryIoChannelTransition::TemporaryIoChannelInitializing(
+                        runtime_resource::TemporaryIoChannelInitializing {
+                            instance_name: "temporary-storage".to_owned(),
+                            parent_group_id: parent_id,
+                            resource_type_name: TEMPORARY_IO_CHANNEL_TYPE_NAME.to_owned(),
+                        },
+                    ),
+                )),
+            ),
+            event(
+                TEMPORARY_IO_CHANNEL_ID,
+                111,
+                DuckDBEvent::TemporaryIoChannel(fsm(
+                    1,
+                    runtime_resource::TemporaryIoChannelTransition::TemporaryIoChannelOperating(
+                        runtime_resource::TemporaryIoChannelOperating {
+                            capacity_operations: Capacity::new(None),
+                            capacity_buffer_bytes: Capacity::new(None),
+                        },
+                    ),
+                )),
+            ),
+            event(
+                TEMPORARY_IO_CHANNEL_ID,
+                ONE_SECOND_NS + 123,
+                DuckDBEvent::TemporaryIoChannel(fsm(
+                    2,
+                    runtime_resource::TemporaryIoChannelTransition::TemporaryIoChannelFinalizing(
+                        runtime_resource::TemporaryIoChannelFinalizing,
+                    ),
+                )),
+            ),
+            event(
+                TEMPORARY_IO_CHANNEL_ID,
+                ONE_SECOND_NS + 124,
+                DuckDBEvent::TemporaryIoChannel(fsm(
+                    3,
+                    runtime_resource::TemporaryIoChannelTransition::Exit,
+                )),
+            ),
+        ]
     }
 
     fn base_events() -> Vec<Event<DuckDBEvent>> {
@@ -1500,6 +1706,68 @@ mod tests {
         ]
     }
 
+    fn temporary_io_events(
+        id: Uuid,
+        task_id: Uuid,
+        trigger_operator_id: Uuid,
+    ) -> Vec<Event<DuckDBEvent>> {
+        vec![
+            event(
+                id,
+                115,
+                DuckDBEvent::TemporaryBlockIo(fsm(
+                    0,
+                    temporary_block_io::TemporaryBlockIoTransition::IoRequested(
+                        temporary_block_io::IoRequested {
+                            instance_name: "write block 42".to_owned(),
+                            query_id: QUERY_ID,
+                            plan_id: PLAN_ID,
+                            task_id,
+                            trigger_operator_id,
+                            block_id: 42,
+                            memory_tag: "HASH_TABLE".to_owned(),
+                            direction: "write".to_owned(),
+                        },
+                    ),
+                )),
+            ),
+            event(
+                id,
+                120,
+                DuckDBEvent::TemporaryBlockIo(fsm(
+                    1,
+                    temporary_block_io::TemporaryBlockIoTransition::IoActive(
+                        temporary_block_io::IoActive {
+                            channel: Some(temporary_io_usage(1, 100)),
+                        },
+                    ),
+                )),
+            ),
+            event(
+                id,
+                ONE_SECOND_NS + 120,
+                DuckDBEvent::TemporaryBlockIo(fsm(
+                    2,
+                    temporary_block_io::TemporaryBlockIoTransition::IoCompleted(
+                        temporary_block_io::IoCompleted {
+                            instance_name: String::new(),
+                            success: true,
+                            storage_bytes: 80,
+                        },
+                    ),
+                )),
+            ),
+            event(
+                id,
+                ONE_SECOND_NS + 121,
+                DuckDBEvent::TemporaryBlockIo(fsm(
+                    3,
+                    temporary_block_io::TemporaryBlockIoTransition::Exit,
+                )),
+            ),
+        ]
+    }
+
     fn analyzer() -> DuckDbUiAnalyzer {
         let events = base_events()
             .into_iter()
@@ -1529,6 +1797,28 @@ mod tests {
                 240,
                 true,
             ));
+        DuckDbUiAnalyzer::try_new(ENGINE_ID, events).unwrap()
+    }
+
+    fn temporary_io_analyzer(
+        id: Uuid,
+        task_id: Uuid,
+        trigger_operator_id: Uuid,
+        parent_id: Uuid,
+    ) -> DuckDbUiAnalyzer {
+        let events = base_events()
+            .into_iter()
+            .chain(resource_events())
+            .chain(simple_task_events(
+                TASK_ID,
+                WORKER_ID,
+                vec![SOURCE_ID],
+                TASK_QUEUE_ID,
+                EXECUTION_THREAD_ID,
+            ))
+            .chain(temporary_io_channel_events(parent_id))
+            .chain(temporary_io_events(id, task_id, trigger_operator_id));
+
         DuckDbUiAnalyzer::try_new(ENGINE_ID, events).unwrap()
     }
 
@@ -1619,6 +1909,27 @@ mod tests {
         }
     }
 
+    fn temporary_io_request(
+        operator_ids: Vec<Uuid>,
+    ) -> SingleTimelineRequest<QueryFilter, OperatorFilter> {
+        SingleTimelineRequest {
+            entry: TimelineRequest::Resource(ResourceTimelineRequest {
+                resource_id: TEMPORARY_IO_CHANNEL_ID,
+                long_entities_threshold_s: None,
+                entity_filter: EntityFilter {
+                    entity_type_name: Some(TEMPORARY_BLOCK_IO_TYPE_NAME.to_owned()),
+                },
+                application: OperatorFilter { operator_ids },
+                config: TimelineConfig {
+                    num_bins: 1,
+                    start: to_secs(20),
+                    end: to_secs(ONE_SECOND_NS + 20),
+                },
+            }),
+            app_params: QueryFilter { query_id: QUERY_ID },
+        }
+    }
+
     #[test]
     fn bundle_declares_runtime_fsms() {
         let bundle = analyzer().query_bundle(QUERY_ID).unwrap();
@@ -1640,6 +1951,12 @@ mod tests {
                 .entities
                 .fsm_types
                 .contains_key(OPERATOR_INVOCATION_TYPE_NAME)
+        );
+        assert!(
+            bundle
+                .entities
+                .fsm_types
+                .contains_key(TEMPORARY_BLOCK_IO_TYPE_NAME)
         );
         assert_eq!(bundle.entities.resources.len(), 3);
         assert!(
@@ -1941,6 +2258,178 @@ mod tests {
             invocation_timeline.capacities_states_values["unit"]["invocation_running"],
             [0.0, 0.0, 0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         );
+    }
+
+    #[test]
+    fn operator_selection_filters_runtime_timelines() {
+        let events = base_events()
+            .into_iter()
+            .chain(resource_events())
+            .chain(simple_task_events(
+                TASK_ID,
+                WORKER_ID,
+                vec![SOURCE_ID],
+                TASK_QUEUE_ID,
+                EXECUTION_THREAD_ID,
+            ))
+            .chain(invocation_events());
+        let analyzer = DuckDbUiAnalyzer::try_new(ENGINE_ID, events).unwrap();
+
+        for entity_type in [PIPELINE_TASK_TYPE_NAME, OPERATOR_INVOCATION_TYPE_NAME] {
+            let selected = analyzer
+                .single_resource_timeline(single_resource_request(
+                    EXECUTION_THREAD_ID,
+                    Some(entity_type),
+                    vec![SOURCE_ID],
+                ))
+                .unwrap();
+            let unselected = analyzer
+                .single_resource_timeline(single_resource_request(
+                    EXECUTION_THREAD_ID,
+                    Some(entity_type),
+                    vec![TARGET_ID],
+                ))
+                .unwrap();
+            let UiResourceTimeline::BinnedByState(selected) = selected.data else {
+                panic!("expected keyed resource timeline");
+            };
+            let UiResourceTimeline::BinnedByState(unselected) = unselected.data else {
+                panic!("expected keyed resource timeline");
+            };
+
+            let selected_usage = selected.capacities_states_values["unit"]
+                .values()
+                .flatten()
+                .sum::<f64>();
+            let unselected_usage = unselected
+                .capacities_states_values
+                .get("unit")
+                .into_iter()
+                .flat_map(|states| states.values())
+                .flatten()
+                .sum::<f64>();
+
+            assert!(selected_usage > 0.0);
+            assert_eq!(unselected_usage, 0.0);
+        }
+    }
+
+    #[test]
+    fn temporary_io_reports_per_second_rates() {
+        let analyzer = temporary_io_analyzer(TEMPORARY_IO_ID, TASK_ID, SOURCE_ID, WORKER_ID);
+        let bundle = analyzer.query_bundle(QUERY_ID).unwrap();
+        let resource_type = &bundle.entities.resource_types[TEMPORARY_IO_CHANNEL_TYPE_NAME];
+
+        assert_eq!(resource_type.capacities.len(), 2);
+        assert!(
+            resource_type
+                .capacities
+                .iter()
+                .all(|capacity| matches!(capacity.kind, CapacityKind::Rate))
+        );
+        assert!(
+            bundle
+                .quantity_specs
+                .contains_key(IO_OPERATIONS_CAPACITY_NAME)
+        );
+        assert!(
+            bundle
+                .quantity_specs
+                .contains_key(IO_BUFFER_BYTES_CAPACITY_NAME)
+        );
+        assert!(
+            resource_type
+                .used_by
+                .contains(&TEMPORARY_BLOCK_IO_TYPE_NAME.to_owned())
+        );
+
+        let selected = analyzer
+            .list_entities(list_request(TEMPORARY_BLOCK_IO_TYPE_NAME, vec![SOURCE_ID]))
+            .unwrap();
+        let unselected = analyzer
+            .list_entities(list_request(TEMPORARY_BLOCK_IO_TYPE_NAME, vec![TARGET_ID]))
+            .unwrap();
+        assert_eq!(selected.total, 1);
+        assert_eq!(unselected.total, 0);
+
+        let response = analyzer
+            .single_resource_timeline(temporary_io_request(vec![SOURCE_ID]))
+            .unwrap();
+        let UiResourceTimeline::BinnedByState(timeline) = response.data else {
+            panic!("expected keyed resource timeline");
+        };
+        let operations =
+            timeline.capacities_states_values[IO_OPERATIONS_CAPACITY_NAME]["io_active"][0];
+        let buffer_bytes =
+            timeline.capacities_states_values[IO_BUFFER_BYTES_CAPACITY_NAME]["io_active"][0];
+
+        assert!((operations - 1.0).abs() < f64::EPSILON);
+        assert!((buffer_bytes - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn temporary_io_validates_links_and_nil_trigger() {
+        let events = base_events()
+            .into_iter()
+            .chain(resource_events())
+            .chain(simple_task_events(
+                TASK_ID,
+                WORKER_ID,
+                vec![SOURCE_ID],
+                TASK_QUEUE_ID,
+                EXECUTION_THREAD_ID,
+            ))
+            .chain(temporary_io_channel_events(WORKER_ID))
+            .chain(temporary_io_events(
+                INVALID_TEMPORARY_IO_ID,
+                TASK_ID,
+                TARGET_ID,
+            ))
+            .chain(temporary_io_events(
+                NIL_TEMPORARY_IO_ID,
+                Uuid::nil(),
+                Uuid::nil(),
+            ));
+        let analyzer = DuckDbUiAnalyzer::try_new(ENGINE_ID, events).unwrap();
+
+        let all = analyzer
+            .list_entities(list_request(TEMPORARY_BLOCK_IO_TYPE_NAME, vec![]))
+            .unwrap();
+        let selected = analyzer
+            .list_entities(list_request(TEMPORARY_BLOCK_IO_TYPE_NAME, vec![SOURCE_ID]))
+            .unwrap();
+
+        assert_eq!(all.total, 1);
+        assert_eq!(selected.total, 0);
+    }
+
+    #[test]
+    fn temporary_io_channel_gets_snapshot_exit() {
+        let events = base_events()
+            .into_iter()
+            .chain(resource_events())
+            .chain(simple_task_events(
+                TASK_ID,
+                WORKER_ID,
+                vec![SOURCE_ID],
+                TASK_QUEUE_ID,
+                EXECUTION_THREAD_ID,
+            ))
+            .chain(temporary_io_channel_events(WORKER_ID).into_iter().take(2))
+            .chain(temporary_io_events(TEMPORARY_IO_ID, TASK_ID, SOURCE_ID));
+
+        assert!(DuckDbUiAnalyzer::try_new(ENGINE_ID, events).is_ok());
+    }
+
+    #[test]
+    fn temporary_io_requires_worker_channel() {
+        let analyzer =
+            temporary_io_analyzer(TEMPORARY_IO_ID, TASK_ID, SOURCE_ID, UNKNOWN_WORKER_ID);
+        let entities = analyzer
+            .list_entities(list_request(TEMPORARY_BLOCK_IO_TYPE_NAME, vec![]))
+            .unwrap();
+
+        assert_eq!(entities.total, 0);
     }
 
     #[test]

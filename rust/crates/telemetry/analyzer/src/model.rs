@@ -29,12 +29,16 @@ use uuid::Uuid;
 use crate::{
     chunk_transfer::{ChunkTransfer, ChunkTransferBuilder},
     operator_invocation::{OperatorInvocation, OperatorInvocationBuilder, OperatorInvocationExt},
-    pipeline_task::{PipelineTask, PipelineTaskBuilder, PipelineTaskExt},
+    pipeline_task::{PipelineTask, PipelineTaskBuilder, PipelineTaskExt, task_plan_id},
+    temporary_block_io::{TemporaryBlockIo, TemporaryBlockIoBuilder, TemporaryBlockIoExt},
 };
 
 pub(crate) const EXECUTION_THREAD_TYPE_NAME: &str = "execution_thread";
 pub(crate) const TASK_QUEUE_TYPE_NAME: &str = "task_queue";
 pub(crate) const QUEUE_ENTRIES_CAPACITY_NAME: &str = "capacity_entries";
+pub(crate) const TEMPORARY_IO_CHANNEL_TYPE_NAME: &str = "temporary_io_channel";
+pub(crate) const IO_OPERATIONS_CAPACITY_NAME: &str = "capacity_operations";
+pub(crate) const IO_BUFFER_BYTES_CAPACITY_NAME: &str = "capacity_buffer_bytes";
 
 fn validate_resource_type(actual: &str, expected: &str, id: Uuid) -> AnalyzerResult<()> {
     if actual == expected {
@@ -58,6 +62,16 @@ fn insert_resource_types(resources: &mut InMemoryResources) {
             [CapacityDecl::new_occupancy(QUEUE_ENTRIES_CAPACITY_NAME)],
         ),
     );
+    resources.resource_types.insert(
+        TEMPORARY_IO_CHANNEL_TYPE_NAME.to_owned(),
+        ResourceTypeDecl::new(
+            TEMPORARY_IO_CHANNEL_TYPE_NAME,
+            vec![
+                CapacityDecl::new_rate(IO_OPERATIONS_CAPACITY_NAME),
+                CapacityDecl::new_rate(IO_BUFFER_BYTES_CAPACITY_NAME),
+            ],
+        ),
+    );
 }
 
 pub struct DuckDbModel {
@@ -66,6 +80,7 @@ pub struct DuckDbModel {
     pub(crate) pipeline_tasks: HashMap<Uuid, PipelineTask>,
     pub(crate) chunk_transfers: HashMap<Uuid, ChunkTransfer>,
     pub(crate) operator_invocations: HashMap<Uuid, OperatorInvocation>,
+    pub(crate) temporary_block_ios: HashMap<Uuid, TemporaryBlockIo>,
     pub(crate) resource_group_types: HashMap<String, ResourceGroupTypeDecl>,
 }
 
@@ -97,7 +112,8 @@ impl Model for DuckDbModel {
         }
 
         (self.pipeline_tasks.contains_key(&entity_id)
-            || self.operator_invocations.contains_key(&entity_id))
+            || self.operator_invocations.contains_key(&entity_id)
+            || self.temporary_block_ios.contains_key(&entity_id))
         .then_some(EntityRef::Task(entity_id))
         .ok_or(AnalyzerError::InvalidId(entity_id))
     }
@@ -252,6 +268,7 @@ pub(crate) struct DuckDbModelBuilder {
     pipeline_tasks: HashMap<Uuid, PipelineTaskBuilder>,
     chunk_transfers: HashMap<Uuid, ChunkTransferBuilder>,
     operator_invocations: HashMap<Uuid, OperatorInvocationBuilder>,
+    temporary_block_ios: HashMap<Uuid, TemporaryBlockIoBuilder>,
     active_runtime_resources: HashSet<Uuid>,
     finalizing_runtime_resources: HashSet<Uuid>,
     engine_active: bool,
@@ -268,6 +285,7 @@ impl DuckDbModelBuilder {
             pipeline_tasks: HashMap::new(),
             chunk_transfers: HashMap::new(),
             operator_invocations: HashMap::new(),
+            temporary_block_ios: HashMap::new(),
             active_runtime_resources: HashSet::new(),
             finalizing_runtime_resources: HashSet::new(),
             engine_active: false,
@@ -308,8 +326,19 @@ impl DuckDbModelBuilder {
                 builder.push(Event::new(id, timestamp, event));
                 Ok(())
             }
+            DuckDBEvent::TemporaryBlockIo(event) => {
+                let builder = self
+                    .temporary_block_ios
+                    .entry(id)
+                    .or_insert(TemporaryBlockIoBuilder::try_new(id)?);
+                builder.push(Event::new(id, timestamp, event));
+                Ok(())
+            }
             DuckDBEvent::ExecutionThread(event) => self.push_execution_thread(id, timestamp, event),
             DuckDBEvent::TaskQueue(event) => self.push_task_queue(id, timestamp, event),
+            DuckDBEvent::TemporaryIoChannel(event) => {
+                self.push_temporary_io_channel(id, timestamp, event)
+            }
             DuckDBEvent::Engine(event) => {
                 self.push_query_engine(id, timestamp, QueryEngineEvent::Engine(event))
             }
@@ -437,6 +466,57 @@ impl DuckDbModelBuilder {
         Ok(())
     }
 
+    fn push_temporary_io_channel(
+        &mut self,
+        id: Uuid,
+        timestamp: u64,
+        event: runtime_resource::TemporaryIoChannelEvent,
+    ) -> AnalyzerResult<()> {
+        use runtime_resource::TemporaryIoChannelTransition;
+
+        let builder = self.runtime_resources.try_builder(id)?;
+        match event.state {
+            TemporaryIoChannelTransition::TemporaryIoChannelInitializing(init) => {
+                validate_resource_type(
+                    &init.resource_type_name,
+                    TEMPORARY_IO_CHANNEL_TYPE_NAME,
+                    id,
+                )?;
+                builder.push(RtResourceTransition::Init(timestamp));
+                builder.set_type_name(init.resource_type_name);
+                builder.set_instance_name(Some(init.instance_name));
+                builder.set_parent_group_id(init.parent_group_id);
+            }
+            TemporaryIoChannelTransition::TemporaryIoChannelOperating(operating) => {
+                builder.push(RtResourceTransition::Operating(
+                    timestamp,
+                    ResourceCapacities(vec![
+                        CapacityValue::new(
+                            IO_OPERATIONS_CAPACITY_NAME,
+                            operating.capacity_operations.value.unwrap_or(0),
+                        ),
+                        CapacityValue::new(
+                            IO_BUFFER_BYTES_CAPACITY_NAME,
+                            operating.capacity_buffer_bytes.value.unwrap_or(0),
+                        ),
+                    ]),
+                ));
+                self.active_runtime_resources.insert(id);
+                self.finalizing_runtime_resources.remove(&id);
+            }
+            TemporaryIoChannelTransition::TemporaryIoChannelFinalizing(_) => {
+                builder.push(RtResourceTransition::Finalizing(timestamp));
+                self.finalizing_runtime_resources.insert(id);
+            }
+            TemporaryIoChannelTransition::Exit => {
+                builder.push(RtResourceTransition::Exit(timestamp));
+                self.active_runtime_resources.remove(&id);
+                self.finalizing_runtime_resources.remove(&id);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn try_build(mut self) -> AnalyzerResult<DuckDbModel> {
         // Engine and worker lifetimes outlive completed queries in collector
         // captures. Close them only in this immutable analyzer snapshot so
@@ -486,6 +566,11 @@ impl DuckDbModelBuilder {
             .into_iter()
             .map(|(id, builder)| builder.try_build().map(|invocation| (id, invocation)))
             .collect::<AnalyzerResult<HashMap<_, _>>>()?;
+        let temporary_block_ios = self
+            .temporary_block_ios
+            .into_iter()
+            .map(|(id, builder)| builder.try_build().map(|io| (id, io)))
+            .collect::<AnalyzerResult<HashMap<_, _>>>()?;
 
         let mut query_engine = self.query_engine.try_build()?;
         let valid_tasks: HashMap<Uuid, HashSet<Uuid>> = pipeline_tasks
@@ -496,12 +581,29 @@ impl DuckDbModelBuilder {
                     .map(|operator_ids| (*id, operator_ids.iter().copied().collect()))
             })
             .collect();
+        let valid_task_plans = pipeline_tasks
+            .iter()
+            .filter(|(id, _)| valid_tasks.contains_key(id))
+            .filter_map(|(id, task)| task_plan_id(task).map(|plan_id| (*id, plan_id)))
+            .collect::<HashMap<_, _>>();
         let valid_invocations: Vec<&OperatorInvocation> = operator_invocations
             .values()
             .filter(|invocation| {
                 invocation_is_valid(invocation, &valid_tasks, &query_engine, &runtime_resources)
             })
             .collect();
+        let valid_temporary_ios = temporary_block_ios
+            .values()
+            .filter(|io| {
+                temporary_io_is_valid(
+                    io,
+                    &valid_task_plans,
+                    &valid_tasks,
+                    &query_engine,
+                    &runtime_resources,
+                )
+            })
+            .collect::<Vec<_>>();
 
         for entity in pipeline_tasks
             .iter()
@@ -509,6 +611,11 @@ impl DuckDbModelBuilder {
             .map(|(_, entity)| entity as &dyn EntityUsing)
             .chain(
                 valid_invocations
+                    .iter()
+                    .map(|entity| *entity as &dyn EntityUsing),
+            )
+            .chain(
+                valid_temporary_ios
                     .iter()
                     .map(|entity| *entity as &dyn EntityUsing),
             )
@@ -531,6 +638,7 @@ impl DuckDbModelBuilder {
             pipeline_tasks,
             chunk_transfers,
             operator_invocations,
+            temporary_block_ios,
             resource_group_types: HashMap::new(),
         };
         let mut resource_group_types = derive_resource_group_types(&model)?;
@@ -621,6 +729,30 @@ fn invocation_is_valid(
         && invocation.resources_are_valid(&topology.plan_workers, resources)
 }
 
+fn temporary_io_is_valid(
+    io: &TemporaryBlockIo,
+    task_plans: &HashMap<Uuid, Uuid>,
+    task_operators: &HashMap<Uuid, HashSet<Uuid>>,
+    query_engine: &InMemoryQueryEngineModel,
+    resources: &InMemoryResources,
+) -> bool {
+    let Some(topology) = io
+        .query_id()
+        .and_then(|query_id| integrity_topology(query_engine, query_id))
+    else {
+        return false;
+    };
+    io.is_complete()
+        && io.belongs_to_query(
+            &topology.operator_plans,
+            &topology.plan_workers,
+            &topology.plan_ids,
+            task_plans,
+            task_operators,
+        )
+        && io.resources_are_valid(&topology.plan_workers, resources)
+}
+
 trait EntityUsing: Entity {
     fn populate_used_by(&self, resources: &mut InMemoryResources) -> AnalyzerResult<()>;
 }
@@ -652,6 +784,12 @@ impl EntityUsing for PipelineTask {
 }
 
 impl EntityUsing for OperatorInvocation {
+    fn populate_used_by(&self, resources: &mut InMemoryResources) -> AnalyzerResult<()> {
+        populate_used_by(self, self.usages(), resources)
+    }
+}
+
+impl EntityUsing for TemporaryBlockIo {
     fn populate_used_by(&self, resources: &mut InMemoryResources) -> AnalyzerResult<()> {
         populate_used_by(self, self.usages(), resources)
     }

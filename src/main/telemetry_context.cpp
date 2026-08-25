@@ -14,10 +14,14 @@
 #include "duckdb-telemetry-bridge/gen/query_group.rs.h"
 #include "duckdb-telemetry-bridge/gen/execution_thread.rs.h"
 #include "duckdb-telemetry-bridge/gen/task_queue.rs.h"
+#include "duckdb-telemetry-bridge/gen/temporary_block_io.rs.h"
+#include "duckdb-telemetry-bridge/gen/temporary_io_channel.rs.h"
 #include "duckdb-telemetry-bridge/gen/uuid.rs.h"
 #include "duckdb-telemetry-bridge/gen/worker.rs.h"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/enum_util.hpp"
+#include "duckdb/common/enums/memory_tag.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/mutex.hpp"
@@ -34,6 +38,7 @@
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/storage/temporary_io_probe.hpp"
 
 namespace duckdb {
 
@@ -43,6 +48,10 @@ static constexpr const char *OUTPUT_DIR_ENV = "QUENT_OUTPUT_DIR";
 static constexpr const char *COLLECTOR_ADDRESS_ENV = "QUENT_COLLECTOR_ADDRESS";
 static constexpr const char *DEFAULT_OUTPUT_DIR = "events";
 static constexpr const char *DEFAULT_COLLECTOR_ADDRESS = "http://localhost:7836";
+static constexpr const char *TEMP_SPILL_NAME = "temporary-spill";
+static constexpr const char *TEMP_RELOAD_NAME = "temporary-reload";
+
+enum class TelemetryIoOutcome : uint8_t { SUCCESS, FAILURE };
 
 static const char *OperatorPhaseName(TelemetryOperatorPhase phase) {
 	switch (phase) {
@@ -57,6 +66,56 @@ static const char *OperatorPhaseName(TelemetryOperatorPhase phase) {
 	}
 	throw InternalException("Unknown telemetry operator phase");
 }
+
+static const char *IoDirectionName(TemporaryIoDirection direction) {
+	switch (direction) {
+	case TemporaryIoDirection::SPILL:
+		return "spill";
+	case TemporaryIoDirection::RELOAD:
+		return "reload";
+	}
+	throw InternalException("Unknown temporary I/O direction");
+}
+
+class QuentTemporaryIoEvent final : public TemporaryIoEvent {
+public:
+	explicit QuentTemporaryIoEvent(rust::Box<quent::temporary_block_io::TemporaryBlockIoHandle> handle_p)
+	    : handle(std::move(handle_p)) {
+	}
+
+	~QuentTemporaryIoEvent() override {
+		try {
+			Finish(TelemetryIoOutcome::FAILURE, 0);
+		} catch (...) {
+		}
+	}
+
+	void Complete(uint64_t storage_bytes) noexcept override {
+		try {
+			Finish(TelemetryIoOutcome::SUCCESS, storage_bytes);
+		} catch (...) {
+		}
+	}
+
+private:
+	void Finish(TelemetryIoOutcome outcome, uint64_t storage_bytes) {
+		if (finished) {
+			return;
+		}
+		finished = true;
+
+		quent::temporary_block_io::IoCompleted completed;
+		completed.instance_name = "";
+		completed.success = outcome == TelemetryIoOutcome::SUCCESS;
+		completed.storage_bytes = storage_bytes;
+		handle->io_completed(std::move(completed));
+		handle->exit();
+	}
+
+private:
+	rust::Box<quent::temporary_block_io::TemporaryBlockIoHandle> handle;
+	bool finished = false;
+};
 
 struct OperatorIds {
 	uuid::UUID operator_id;
@@ -122,6 +181,42 @@ struct InvocationTelemetry {
 	rust::Box<quent::operator_invocation::OperatorInvocationHandle> handle;
 	uuid::UUID task_id;
 };
+
+struct IoAttribution {
+	const_reference<PipelineExecutor> executor;
+	uuid::UUID query_id;
+	uuid::UUID plan_id;
+	uuid::UUID task_id;
+	uuid::UUID operator_id;
+};
+
+static thread_local vector<IoAttribution> active_io_attributions;
+
+static void PushIoAttribution(const PipelineExecutor &executor, uuid::UUID query_id, uuid::UUID plan_id,
+                              uuid::UUID task_id, uuid::UUID operator_id) {
+	active_io_attributions.push_back({std::cref(executor), query_id, plan_id, task_id, operator_id});
+}
+
+static void RemoveIoAttribution(const PipelineExecutor &executor) {
+	for (idx_t index = active_io_attributions.size(); index > 0; index--) {
+		if (&active_io_attributions[index - 1].executor.get() != &executor) {
+			continue;
+		}
+
+		active_io_attributions.erase(active_io_attributions.begin() + index - 1);
+		return;
+	}
+}
+
+static optional<IoAttribution> CurrentIoAttribution(uuid::UUID query_id) {
+	for (idx_t index = active_io_attributions.size(); index > 0; index--) {
+		auto &attribution = active_io_attributions[index - 1];
+		if (attribution.query_id == query_id) {
+			return attribution;
+		}
+	}
+	return nullopt;
+}
 
 class PlanEmitter {
 public:
@@ -426,10 +521,12 @@ public:
 			running.execution_thread_resource_id = execution_thread_id;
 			handle->invocation_running(std::move(running));
 			invocations.emplace(std::cref(executor), InvocationTelemetry(std::move(handle), task_id));
+			PushIoAttribution(executor, (*query)->uuid(), plan->plan_id, task_id, operator_id);
 		}
 
 		void InvocationFinished(const PipelineExecutor &executor, const PhysicalOperator &,
 		                        optional_ptr<const DataChunk> output) {
+			RemoveIoAttribution(executor);
 			optional<rust::Box<quent::operator_invocation::OperatorInvocationHandle>> handle;
 			{
 				lock_guard<mutex> guard(lock);
@@ -482,6 +579,41 @@ public:
 			handle->exit();
 		}
 
+		unique_ptr<TemporaryIoEvent> StartTempIo(const TemporaryIoInfo &info) {
+			lock_guard<mutex> guard(lock);
+			if (!query || !plan) {
+				return nullptr;
+			}
+
+			auto query_id = (*query)->uuid();
+			auto task_id = uuid::new_nil();
+			auto operator_id = uuid::new_nil();
+			auto attribution = CurrentIoAttribution(query_id);
+			if (attribution && attribution->plan_id == plan->plan_id) {
+				task_id = attribution->task_id;
+				operator_id = attribution->operator_id;
+			}
+
+			quent::temporary_block_io::IoRequested requested;
+			requested.instance_name = "temporary-block-io-" + std::to_string(next_temp_io_index++);
+			requested.query_id = query_id;
+			requested.plan_id = plan->plan_id;
+			requested.task_id = task_id;
+			requested.trigger_operator_id = operator_id;
+			requested.block_id = info.block_id;
+			requested.memory_tag = EnumUtil::ToString(info.tag);
+			requested.direction = IoDirectionName(info.direction);
+			auto handle = quent::temporary_block_io::create(*telemetry->context, std::move(requested));
+
+			quent::temporary_block_io::IoActive active;
+			active.channel_resource_id = telemetry->TemporaryIoChannelId(info.direction);
+			active.channel_capacity_operations = 1;
+			active.channel_capacity_buffer_bytes = info.buffer_bytes;
+			handle->io_active(std::move(active));
+
+			return make_uniq<QuentTemporaryIoEvent>(std::move(handle));
+		}
+
 	private:
 		static void CompleteInvocation(rust::Box<quent::operator_invocation::OperatorInvocationHandle> handle,
 		                               TelemetryTaskOutcome outcome, optional_ptr<const DataChunk> output) {
@@ -496,6 +628,7 @@ public:
 
 		void FinishInvocation(const PipelineExecutor &executor, TelemetryTaskOutcome outcome,
 		                      optional_ptr<const DataChunk> output) {
+			RemoveIoAttribution(executor);
 			auto entry = invocations.find(std::cref(executor));
 			if (entry == invocations.end()) {
 				return;
@@ -512,6 +645,7 @@ public:
 					entry++;
 					continue;
 				}
+				RemoveIoAttribution(entry->first.get());
 				handles.push_back(std::move(entry->second.handle));
 				entry = invocations.erase(entry);
 			}
@@ -522,6 +656,7 @@ public:
 			vector<rust::Box<quent::operator_invocation::OperatorInvocationHandle>> handles;
 			handles.reserve(invocations.size());
 			for (auto &entry : invocations) {
+				RemoveIoAttribution(entry.first.get());
 				handles.push_back(std::move(entry.second.handle));
 			}
 			invocations.clear();
@@ -593,7 +728,24 @@ public:
 		uint64_t next_task_index = 0;
 		uint64_t next_transfer_index = 0;
 		uint64_t next_invocation_index = 0;
+		uint64_t next_temp_io_index = 0;
 		bool query_group_declared = false;
+	};
+
+	class TempIoProbe final : public TemporaryIoProbe {
+	public:
+		unique_ptr<TemporaryIoEvent> Start(const TemporaryIoInfo &info) override {
+			auto context = info.context.GetClientContext();
+			if (!context) {
+				return nullptr;
+			}
+
+			auto state = context->registered_state->Get<ClientState>(TELEMETRY_STATE_NAME);
+			if (!state) {
+				return nullptr;
+			}
+			return state->StartTempIo(info);
+		}
 	};
 
 	Impl(rust::Box<quent::ExporterOptions> exporter, const string &instance_name)
@@ -619,6 +771,9 @@ public:
 		quent::task_queue::Operating operating;
 		operating.capacity_entries = NumericLimits<uint64_t>::Maximum();
 		(*task_queue)->operating(std::move(operating));
+
+		temp_spill_channel.emplace(CreateIoChannel(TEMP_SPILL_NAME));
+		temp_reload_channel.emplace(CreateIoChannel(TEMP_RELOAD_NAME));
 	}
 
 	~Impl() {
@@ -642,6 +797,17 @@ public:
 				(*task_queue)->exit();
 				task_queue.reset();
 			}
+			auto exit_channel = [](auto &channel) {
+				if (!channel) {
+					return;
+				}
+
+				(*channel)->finalizing();
+				(*channel)->exit();
+				channel.reset();
+			};
+			exit_channel(temp_spill_channel);
+			exit_channel(temp_reload_channel);
 		}
 		worker_observer->exit(worker_id);
 		engine_observer->exit(engine_id);
@@ -670,6 +836,32 @@ public:
 		return id;
 	}
 
+	uuid::UUID TemporaryIoChannelId(TemporaryIoDirection direction) const {
+		switch (direction) {
+		case TemporaryIoDirection::SPILL:
+			D_ASSERT(temp_spill_channel);
+			return (*temp_spill_channel)->uuid();
+		case TemporaryIoDirection::RELOAD:
+			D_ASSERT(temp_reload_channel);
+			return (*temp_reload_channel)->uuid();
+		}
+		throw InternalException("Unknown temporary I/O direction");
+	}
+
+private:
+	rust::Box<quent::temporary_io_channel::TemporaryIoChannelHandle> CreateIoChannel(const char *name) {
+		quent::temporary_io_channel::Initializing initializing;
+		initializing.instance_name = name;
+		initializing.parent_group_id = worker_id;
+		auto handle = quent::temporary_io_channel::create(*context, std::move(initializing));
+
+		quent::temporary_io_channel::Operating operating;
+		operating.capacity_operations = NumericLimits<uint64_t>::Maximum();
+		operating.capacity_buffer_bytes = NumericLimits<uint64_t>::Maximum();
+		handle->operating(std::move(operating));
+		return handle;
+	}
+
 private:
 	uuid::UUID engine_id;
 	uuid::UUID worker_id;
@@ -678,6 +870,8 @@ private:
 	rust::Box<quent::worker::WorkerObserver> worker_observer;
 	rust::Box<quent::query_group::QueryGroupObserver> query_group_observer;
 	optional<rust::Box<quent::task_queue::TaskQueueHandle>> task_queue;
+	optional<rust::Box<quent::temporary_io_channel::TemporaryIoChannelHandle>> temp_spill_channel;
+	optional<rust::Box<quent::temporary_io_channel::TemporaryIoChannelHandle>> temp_reload_channel;
 	unordered_map<string, rust::Box<quent::execution_thread::ExecutionThreadHandle>> execution_threads;
 	mutex resource_lock;
 	bool exited = false;
@@ -702,6 +896,13 @@ void TelemetryContext::Initialize(ClientContext &context) {
 	if (impl) {
 		context.registered_state->Insert(TELEMETRY_STATE_NAME, make_shared_ptr<Impl::ClientState>(impl));
 	}
+}
+
+shared_ptr<TemporaryIoProbe> TelemetryContext::TempIoProbe() {
+	if (!impl) {
+		return nullptr;
+	}
+	return make_shared_ptr<Impl::TempIoProbe>();
 }
 
 void TelemetryContext::StartExecution(ClientContext &context, const PhysicalOperator &root) {
@@ -821,6 +1022,10 @@ TelemetryContext::~TelemetryContext() {
 }
 
 void TelemetryContext::Initialize(ClientContext &) {
+}
+
+shared_ptr<TemporaryIoProbe> TelemetryContext::TempIoProbe() {
+	return nullptr;
 }
 
 void TelemetryContext::StartExecution(ClientContext &, const PhysicalOperator &) {
