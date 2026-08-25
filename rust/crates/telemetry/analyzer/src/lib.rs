@@ -4,7 +4,9 @@ use duckdb_telemetry_model::{DuckDB, DuckDBEvent, chunk_transfer::ChunkTransferT
 use quent_analyzer::{
     AnalyzerError, AnalyzerResult, Entity, Span,
     fsm::{FsmTypeDeclaration, FsmUsages, collection::FsmCollection},
-    resource::{Usage, Using, collection::ResourceCollection, tree::ResourceTreeNode},
+    resource::{
+        CapacityValue, Usage, Using, collection::ResourceCollection, tree::ResourceTreeNode,
+    },
     timeline::binned::resource::{
         ResourceTimeline, ResourceTimelineBuilder, ResourceTimelineByKey,
         ResourceTimelineByKeyBuilder,
@@ -22,7 +24,7 @@ use quent_query_engine_ui::{
     DataFlowTimelineBinned, OperatorFilter, QueryBundle, QueryEntities, QueryFilter,
 };
 use quent_simulator_ui::EntityRef;
-use quent_time::{TimeUnixNanoSec, to_nanosecs, to_secs};
+use quent_time::{TimeUnixNanoSec, span::SpanUnixNanoSec, to_nanosecs, to_secs};
 use quent_ui::{
     FiniteStateMachine, ResourceGroupNode, ResourceTree, convert_resource_tree,
     entities::{request::EntityListRequest, response::EntityListResponse},
@@ -44,8 +46,10 @@ use uuid::Uuid;
 
 use crate::{
     chunk_transfer::{ChunkTransfer, ChunkTransferExt},
+    memory_account::{MemoryAccount, MemoryAccountExt},
     model::{
-        DuckDbModel, DuckDbModelBuilder, IO_BUFFER_BYTES_CAPACITY_NAME, IO_OPERATIONS_CAPACITY_NAME,
+        DuckDbModel, DuckDbModelBuilder, IO_BUFFER_BYTES_CAPACITY_NAME,
+        IO_OPERATIONS_CAPACITY_NAME, MEMORY_BYTES_CAPACITY_NAME,
     },
     operator_invocation::{OperatorInvocation, OperatorInvocationExt},
     pipeline_task::{PipelineTask, PipelineTaskExt, task_plan_id},
@@ -53,6 +57,7 @@ use crate::{
 };
 
 pub mod chunk_transfer;
+mod memory_account;
 pub mod model;
 pub mod operator_invocation;
 pub mod pipeline_task;
@@ -62,6 +67,7 @@ const PIPELINE_TASK_TYPE_NAME: &str = "pipeline_task";
 const CHUNK_TRANSFER_TYPE_NAME: &str = "chunk_transfer";
 const OPERATOR_INVOCATION_TYPE_NAME: &str = "operator_invocation";
 const TEMPORARY_BLOCK_IO_TYPE_NAME: &str = "temporary_block_io";
+const MEMORY_ACCOUNT_TYPE_NAME: &str = "memory_account";
 const MEASURE_CHUNKS: &str = "chunks";
 const MEASURE_ROWS: &str = "rows";
 const MEASURE_LOGICAL_BYTES: &str = "logical_bytes";
@@ -156,6 +162,29 @@ enum RateScale {
     PerSecond,
 }
 
+struct ClippedUsage<U> {
+    inner: U,
+    span: SpanUnixNanoSec,
+}
+
+impl<'a, U: Usage<'a>> Usage<'a> for ClippedUsage<U> {
+    fn entity_id(&self) -> Uuid {
+        self.inner.entity_id()
+    }
+
+    fn resource_id(&self) -> Uuid {
+        self.inner.resource_id()
+    }
+
+    fn capacities(&self) -> impl Iterator<Item = &'a CapacityValue> {
+        self.inner.capacities()
+    }
+
+    fn span(&self) -> SpanUnixNanoSec {
+        self.span
+    }
+}
+
 impl UiAnalyzer for DuckDbUiAnalyzer {
     type Event = DuckDBEvent;
     type EntityRef = EntityRef;
@@ -180,6 +209,7 @@ impl UiAnalyzer for DuckDbUiAnalyzer {
             chunk_transfers = model.chunk_transfers.len(),
             operator_invocations = model.operator_invocations.len(),
             temporary_block_ios = model.temporary_block_ios.len(),
+            memory_accounts = model.memory_accounts.len(),
             resources = model.runtime_resources.resources.len(),
             "built DuckDB query-engine model"
         );
@@ -223,11 +253,13 @@ impl UiAnalyzer for DuckDbUiAnalyzer {
         let transfer_decl = ChunkTransfer::fsm_type_declaration();
         let invocation_decl = OperatorInvocation::fsm_type_declaration();
         let temporary_io_decl = TemporaryBlockIo::fsm_type_declaration();
+        let memory_account_decl = MemoryAccount::fsm_type_declaration();
         let fsm_types = [
             (task_decl.name.clone(), task_decl),
             (transfer_decl.name.clone(), transfer_decl),
             (invocation_decl.name.clone(), invocation_decl),
             (temporary_io_decl.name.clone(), temporary_io_decl),
+            (memory_account_decl.name.clone(), memory_account_decl),
         ]
         .into_iter()
         .collect();
@@ -335,6 +367,7 @@ impl UiAnalyzer for DuckDbUiAnalyzer {
                     IO_BUFFER_BYTES_CAPACITY_NAME.to_owned(),
                     QuantitySpec::bytes(),
                 ),
+                (MEMORY_BYTES_CAPACITY_NAME.to_owned(), QuantitySpec::bytes()),
             ]
             .into(),
             start_time_unix_ns: epoch,
@@ -440,6 +473,12 @@ impl UiAnalyzer for DuckDbUiAnalyzer {
                 },
                 query,
             ),
+            // Accounts are engine-lived and begin before the query epoch. They
+            // power query-clipped timelines but cannot be rendered as query FSMs.
+            Some(MEMORY_ACCOUNT_TYPE_NAME) => Ok(EntityListResponse {
+                items: vec![],
+                total: 0,
+            }),
             Some(type_name) => Err(AnalyzerError::InvalidArgument(format!(
                 "unknown DuckDB entity type {type_name:?}"
             ))),
@@ -616,6 +655,7 @@ impl DuckDbUiAnalyzer {
     ) -> AnalyzerResult<SingleTimelineResponse> {
         let query_id = request.app_params.query_id;
         let epoch = self.model.query_epoch(query_id)?;
+        let query_span = self.model.query(query_id)?.span()?;
         let topology = self.query_topology(query_id)?;
         let tasks = self.query_tasks(query_id, &topology);
         let config = request.entry.config().try_into_binned_span(epoch)?;
@@ -730,6 +770,26 @@ impl DuckDbUiAnalyzer {
                         }
                     }
                 }
+                MEMORY_ACCOUNT_TYPE_NAME => {
+                    for account in
+                        self.model.memory_accounts.values().filter(|account| {
+                            self.memory_account_matches(account, &operator_filter)
+                        })
+                    {
+                        let Some(memory_tag) = account.memory_tag() else {
+                            continue;
+                        };
+                        for (_, usage) in account.usages_with_state_names() {
+                            if resource_ids.contains(&usage.resource_id()) {
+                                let Some(span) = usage.span().intersection(&query_span) else {
+                                    continue;
+                                };
+                                builder
+                                    .try_push(memory_tag, &ClippedUsage { inner: usage, span })?;
+                            }
+                        }
+                    }
+                }
                 // Chunk publications are point events, not resource occupancy.
                 CHUNK_TRANSFER_TYPE_NAME => {}
                 other => {
@@ -762,6 +822,21 @@ impl DuckDbUiAnalyzer {
                 for usage in io.usages() {
                     if resource_ids.contains(&usage.resource_id()) {
                         builder.try_push(&usage)?;
+                    }
+                }
+            }
+            for account in self
+                .model
+                .memory_accounts
+                .values()
+                .filter(|account| self.memory_account_matches(account, &operator_filter))
+            {
+                for usage in account.usages() {
+                    if resource_ids.contains(&usage.resource_id()) {
+                        let Some(span) = usage.span().intersection(&query_span) else {
+                            continue;
+                        };
+                        builder.try_push(&ClippedUsage { inner: usage, span })?;
                     }
                 }
             }
@@ -865,6 +940,16 @@ impl DuckDbUiAnalyzer {
             )
             && io.resources_are_valid(&topology.plan_workers, &self.model.runtime_resources)
             && io.matches_operator(filter)
+    }
+
+    fn memory_account_matches(&self, account: &MemoryAccount, filter: &OperatorFilter) -> bool {
+        let Ok(engine) = self.model.query_engine.engine() else {
+            return false;
+        };
+
+        account.is_complete()
+            && account.is_valid(engine.id(), &self.model.runtime_resources)
+            && account.matches_operator(filter)
     }
 
     fn entities_to_ui(
@@ -1047,12 +1132,13 @@ fn normalize_rate(rate_scale: RateScale, capacity: &str, values: &mut [f64]) {
 #[cfg(test)]
 mod tests {
     use crate::model::{
-        EXECUTION_THREAD_TYPE_NAME, QUEUE_ENTRIES_CAPACITY_NAME, TASK_QUEUE_TYPE_NAME,
-        TEMPORARY_IO_CHANNEL_TYPE_NAME,
+        BUFFER_POOL_MEMORY_TYPE_NAME, EXECUTION_THREAD_TYPE_NAME, MEMORY_BYTES_CAPACITY_NAME,
+        QUEUE_ENTRIES_CAPACITY_NAME, TASK_QUEUE_TYPE_NAME, TEMPORARY_DIRECTORY_STORAGE_TYPE_NAME,
+        TEMPORARY_IO_CHANNEL_TYPE_NAME, TEMPORARY_STORAGE_TYPE_NAME,
     };
     use duckdb_telemetry_model::{
-        chunk_transfer, engine, operator, operator_invocation, pipeline_task, plan, port, query,
-        query_group, runtime_resource, temporary_block_io, worker,
+        chunk_transfer, engine, memory_account, operator, operator_invocation, pipeline_task, plan,
+        port, query, query_group, runtime_resource, temporary_block_io, worker,
     };
     use quent_model::{Capacity, FsmEvent, Ref, Usage};
     use quent_ui::entities::request::{
@@ -1091,6 +1177,14 @@ mod tests {
     const TEMPORARY_IO_ID: Uuid = Uuid::from_u128(26);
     const INVALID_TEMPORARY_IO_ID: Uuid = Uuid::from_u128(27);
     const NIL_TEMPORARY_IO_ID: Uuid = Uuid::from_u128(28);
+    const BUFFER_POOL_MEMORY_ID: Uuid = Uuid::from_u128(29);
+    const TEMPORARY_STORAGE_ID: Uuid = Uuid::from_u128(30);
+    const TEMPORARY_DIRECTORY_ID: Uuid = Uuid::from_u128(31);
+    const HASH_TABLE_MEMORY_ID: Uuid = Uuid::from_u128(32);
+    const ORDER_BY_MEMORY_ID: Uuid = Uuid::from_u128(33);
+    const TEMPORARY_MEMORY_ID: Uuid = Uuid::from_u128(34);
+    const DIRECTORY_MEMORY_ID: Uuid = Uuid::from_u128(35);
+    const INVALID_MEMORY_ID: Uuid = Uuid::from_u128(36);
     const ONE_SECOND_NS: u64 = 1_000_000_000;
 
     fn event(id: Uuid, timestamp: u64, data: DuckDBEvent) -> Event<DuckDBEvent> {
@@ -1279,6 +1373,233 @@ mod tests {
                 )),
             ),
         ]
+    }
+
+    fn memory_resource_events(parent_id: Uuid) -> Vec<Event<DuckDBEvent>> {
+        vec![
+            event(
+                BUFFER_POOL_MEMORY_ID,
+                90,
+                DuckDBEvent::BufferPoolMemory(fsm(
+                    0,
+                    memory_account::BufferPoolMemoryTransition::BufferPoolMemoryInitializing(
+                        memory_account::BufferPoolMemoryInitializing {
+                            instance_name: "buffer-pool-memory".to_owned(),
+                            parent_group_id: parent_id,
+                            resource_type_name: BUFFER_POOL_MEMORY_TYPE_NAME.to_owned(),
+                        },
+                    ),
+                )),
+            ),
+            event(
+                BUFFER_POOL_MEMORY_ID,
+                91,
+                DuckDBEvent::BufferPoolMemory(fsm(
+                    1,
+                    memory_account::BufferPoolMemoryTransition::BufferPoolMemoryOperating(
+                        memory_account::BufferPoolMemoryOperating {
+                            capacity_bytes: Capacity::new(Some(4096)),
+                        },
+                    ),
+                )),
+            ),
+            event(
+                TEMPORARY_STORAGE_ID,
+                90,
+                DuckDBEvent::TemporaryStorage(fsm(
+                    0,
+                    memory_account::TemporaryStorageTransition::TemporaryStorageInitializing(
+                        memory_account::TemporaryStorageInitializing {
+                            instance_name: "temporary-storage".to_owned(),
+                            parent_group_id: parent_id,
+                            resource_type_name: TEMPORARY_STORAGE_TYPE_NAME.to_owned(),
+                        },
+                    ),
+                )),
+            ),
+            event(
+                TEMPORARY_STORAGE_ID,
+                91,
+                DuckDBEvent::TemporaryStorage(fsm(
+                    1,
+                    memory_account::TemporaryStorageTransition::TemporaryStorageOperating(
+                        memory_account::TemporaryStorageOperating {
+                            capacity_bytes: Capacity::new(Some(2048)),
+                        },
+                    ),
+                )),
+            ),
+            event(
+                TEMPORARY_DIRECTORY_ID,
+                90,
+                DuckDBEvent::TemporaryDirectoryStorage(fsm(
+                    0,
+                    memory_account::TemporaryDirectoryStorageTransition::TemporaryDirectoryStorageInitializing(
+                        memory_account::TemporaryDirectoryStorageInitializing {
+                            instance_name: "temporary-directory-storage".to_owned(),
+                            parent_group_id: parent_id,
+                            resource_type_name: TEMPORARY_DIRECTORY_STORAGE_TYPE_NAME.to_owned(),
+                        },
+                    ),
+                )),
+            ),
+            event(
+                TEMPORARY_DIRECTORY_ID,
+                91,
+                DuckDBEvent::TemporaryDirectoryStorage(fsm(
+                    1,
+                    memory_account::TemporaryDirectoryStorageTransition::TemporaryDirectoryStorageOperating(
+                        memory_account::TemporaryDirectoryStorageOperating {
+                            capacity_bytes: Capacity::new(Some(8192)),
+                        },
+                    ),
+                )),
+            ),
+        ]
+    }
+
+    #[derive(Clone, Copy)]
+    enum MemoryDomain {
+        BufferPool,
+        TemporaryStorage,
+        TemporaryDirectory,
+    }
+
+    fn memory_accounted(domain: MemoryDomain, bytes: u64) -> memory_account::Accounted {
+        let mut accounted = memory_account::Accounted {
+            buffer_pool: None,
+            temporary_storage: None,
+            temporary_directory: None,
+        };
+        match domain {
+            MemoryDomain::BufferPool => {
+                accounted.buffer_pool = Some(Usage {
+                    resource_id: Ref::new(BUFFER_POOL_MEMORY_ID),
+                    capacity: memory_account::BufferPoolMemoryOperating {
+                        capacity_bytes: Capacity::new(Some(bytes)),
+                    },
+                });
+            }
+            MemoryDomain::TemporaryStorage => {
+                accounted.temporary_storage = Some(Usage {
+                    resource_id: Ref::new(TEMPORARY_STORAGE_ID),
+                    capacity: memory_account::TemporaryStorageOperating {
+                        capacity_bytes: Capacity::new(Some(bytes)),
+                    },
+                });
+            }
+            MemoryDomain::TemporaryDirectory => {
+                accounted.temporary_directory = Some(Usage {
+                    resource_id: Ref::new(TEMPORARY_DIRECTORY_ID),
+                    capacity: memory_account::TemporaryDirectoryStorageOperating {
+                        capacity_bytes: Capacity::new(Some(bytes)),
+                    },
+                });
+            }
+        }
+        accounted
+    }
+
+    fn memory_account_events(
+        id: Uuid,
+        memory_tag: &str,
+        domain: MemoryDomain,
+        first_bytes: u64,
+        updated_bytes: Option<u64>,
+        exit: bool,
+    ) -> Vec<Event<DuckDBEvent>> {
+        let mut events = vec![
+            event(
+                id,
+                92,
+                DuckDBEvent::MemoryAccount(fsm(
+                    0,
+                    memory_account::MemoryAccountTransition::AccountRegistered(
+                        memory_account::AccountRegistered {
+                            instance_name: format!("memory-account/{memory_tag}"),
+                            memory_tag: memory_tag.to_owned(),
+                        },
+                    ),
+                )),
+            ),
+            event(
+                id,
+                93,
+                DuckDBEvent::MemoryAccount(fsm(
+                    1,
+                    memory_account::MemoryAccountTransition::Accounted(memory_accounted(
+                        domain,
+                        first_bytes,
+                    )),
+                )),
+            ),
+        ];
+        if let Some(bytes) = updated_bytes {
+            events.push(event(
+                id,
+                150,
+                DuckDBEvent::MemoryAccount(fsm(
+                    2,
+                    memory_account::MemoryAccountTransition::Accounted(memory_accounted(
+                        domain, bytes,
+                    )),
+                )),
+            ));
+        }
+        if exit {
+            events.push(event(
+                id,
+                201,
+                DuckDBEvent::MemoryAccount(fsm(3, memory_account::MemoryAccountTransition::Exit)),
+            ));
+        }
+        events
+    }
+
+    fn memory_events(exit: bool) -> Vec<Event<DuckDBEvent>> {
+        memory_resource_events(ENGINE_ID)
+            .into_iter()
+            .chain(memory_account_events(
+                HASH_TABLE_MEMORY_ID,
+                "HASH_TABLE",
+                MemoryDomain::BufferPool,
+                100,
+                Some(40),
+                exit,
+            ))
+            .chain(memory_account_events(
+                ORDER_BY_MEMORY_ID,
+                "ORDER_BY",
+                MemoryDomain::BufferPool,
+                50,
+                None,
+                exit,
+            ))
+            .chain(memory_account_events(
+                TEMPORARY_MEMORY_ID,
+                "HASH_TABLE",
+                MemoryDomain::TemporaryStorage,
+                80,
+                None,
+                exit,
+            ))
+            .chain(memory_account_events(
+                DIRECTORY_MEMORY_ID,
+                "UNKNOWN",
+                MemoryDomain::TemporaryDirectory,
+                256,
+                None,
+                exit,
+            ))
+            .collect()
+    }
+
+    fn memory_analyzer(exit: bool) -> DuckDbUiAnalyzer {
+        DuckDbUiAnalyzer::try_new(
+            ENGINE_ID,
+            base_events().into_iter().chain(memory_events(exit)),
+        )
+        .unwrap()
     }
 
     fn base_events() -> Vec<Event<DuckDBEvent>> {
@@ -1930,6 +2251,29 @@ mod tests {
         }
     }
 
+    fn memory_request(
+        resource_id: Uuid,
+        entity_type_name: Option<&str>,
+        operator_ids: Vec<Uuid>,
+    ) -> SingleTimelineRequest<QueryFilter, OperatorFilter> {
+        SingleTimelineRequest {
+            entry: TimelineRequest::Resource(ResourceTimelineRequest {
+                resource_id,
+                long_entities_threshold_s: None,
+                entity_filter: EntityFilter {
+                    entity_type_name: entity_type_name.map(str::to_owned),
+                },
+                application: OperatorFilter { operator_ids },
+                config: TimelineConfig {
+                    num_bins: 2,
+                    start: to_secs(20),
+                    end: to_secs(100),
+                },
+            }),
+            app_params: QueryFilter { query_id: QUERY_ID },
+        }
+    }
+
     #[test]
     fn bundle_declares_runtime_fsms() {
         let bundle = analyzer().query_bundle(QUERY_ID).unwrap();
@@ -1976,6 +2320,292 @@ mod tests {
                 .unwrap()
                 .used_by
                 .contains(&OPERATOR_INVOCATION_TYPE_NAME.to_owned())
+        );
+    }
+
+    #[test]
+    fn bundle_declares_memory_gauges() {
+        let bundle = memory_analyzer(true).query_bundle(QUERY_ID).unwrap();
+
+        assert!(
+            bundle
+                .entities
+                .fsm_types
+                .contains_key(MEMORY_ACCOUNT_TYPE_NAME)
+        );
+        assert!(
+            bundle
+                .quantity_specs
+                .contains_key(MEMORY_BYTES_CAPACITY_NAME)
+        );
+        for type_name in [
+            BUFFER_POOL_MEMORY_TYPE_NAME,
+            TEMPORARY_STORAGE_TYPE_NAME,
+            TEMPORARY_DIRECTORY_STORAGE_TYPE_NAME,
+        ] {
+            let resource_type = &bundle.entities.resource_types[type_name];
+            assert_eq!(resource_type.capacities.len(), 1);
+            assert!(matches!(
+                resource_type.capacities[0].kind,
+                CapacityKind::Occupancy
+            ));
+            assert!(
+                resource_type
+                    .used_by
+                    .contains(&MEMORY_ACCOUNT_TYPE_NAME.to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn prequery_memory_accounts_are_timeline_only() {
+        let accounts = memory_analyzer(true)
+            .list_entities(list_request(MEMORY_ACCOUNT_TYPE_NAME, vec![]))
+            .unwrap();
+
+        assert_eq!(accounts.total, 0);
+        assert!(accounts.items.is_empty());
+    }
+
+    #[test]
+    fn memory_timelines_report_totals_and_tags() {
+        let analyzer = memory_analyzer(true);
+
+        let response = analyzer
+            .single_resource_timeline(memory_request(BUFFER_POOL_MEMORY_ID, None, vec![]))
+            .unwrap();
+        let UiResourceTimeline::Binned(timeline) = response.data else {
+            panic!("expected plain memory timeline");
+        };
+        assert_eq!(
+            timeline.capacities_values[MEMORY_BYTES_CAPACITY_NAME],
+            [135.0, 90.0]
+        );
+
+        let response = analyzer
+            .single_resource_timeline(memory_request(
+                BUFFER_POOL_MEMORY_ID,
+                Some(MEMORY_ACCOUNT_TYPE_NAME),
+                vec![],
+            ))
+            .unwrap();
+        let UiResourceTimeline::BinnedByState(timeline) = response.data else {
+            panic!("expected memory-tag timeline");
+        };
+        assert_eq!(
+            timeline.capacities_states_values[MEMORY_BYTES_CAPACITY_NAME]["HASH_TABLE"],
+            [85.0, 40.0]
+        );
+        assert_eq!(
+            timeline.capacities_states_values[MEMORY_BYTES_CAPACITY_NAME]["ORDER_BY"],
+            [50.0, 50.0]
+        );
+
+        for (resource_id, bytes) in [
+            (TEMPORARY_STORAGE_ID, 80.0),
+            (TEMPORARY_DIRECTORY_ID, 256.0),
+        ] {
+            let response = analyzer
+                .single_resource_timeline(memory_request(resource_id, None, vec![]))
+                .unwrap();
+            let UiResourceTimeline::Binned(timeline) = response.data else {
+                panic!("expected plain memory timeline");
+            };
+            assert_eq!(
+                timeline.capacities_values[MEMORY_BYTES_CAPACITY_NAME],
+                [bytes, bytes]
+            );
+        }
+    }
+
+    #[test]
+    fn memory_timeline_clips_to_query_span() {
+        let analyzer = memory_analyzer(false);
+        let request = |entity_type_name: Option<&str>| SingleTimelineRequest {
+            entry: TimelineRequest::Resource(ResourceTimelineRequest {
+                resource_id: BUFFER_POOL_MEMORY_ID,
+                long_entities_threshold_s: None,
+                entity_filter: EntityFilter {
+                    entity_type_name: entity_type_name.map(str::to_owned),
+                },
+                application: OperatorFilter {
+                    operator_ids: vec![],
+                },
+                config: TimelineConfig {
+                    num_bins: 4,
+                    start: to_secs(80),
+                    end: to_secs(120),
+                },
+            }),
+            app_params: QueryFilter { query_id: QUERY_ID },
+        };
+
+        let response = analyzer.single_resource_timeline(request(None)).unwrap();
+        let UiResourceTimeline::Binned(timeline) = response.data else {
+            panic!("expected plain memory timeline");
+        };
+        assert_eq!(
+            timeline.capacities_values[MEMORY_BYTES_CAPACITY_NAME],
+            [90.0, 90.0, 0.0, 0.0]
+        );
+
+        let response = analyzer
+            .single_resource_timeline(request(Some(MEMORY_ACCOUNT_TYPE_NAME)))
+            .unwrap();
+        let UiResourceTimeline::BinnedByState(timeline) = response.data else {
+            panic!("expected memory-tag timeline");
+        };
+        assert_eq!(
+            timeline.capacities_states_values[MEMORY_BYTES_CAPACITY_NAME]["HASH_TABLE"],
+            [40.0, 40.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            timeline.capacities_states_values[MEMORY_BYTES_CAPACITY_NAME]["ORDER_BY"],
+            [50.0, 50.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn init_only_memory_resource_is_snapshot_safe() {
+        let events = base_events()
+            .into_iter()
+            .chain(memory_resource_events(ENGINE_ID).into_iter().take(1));
+        let analyzer = DuckDbUiAnalyzer::try_new(ENGINE_ID, events).unwrap();
+
+        assert!(
+            analyzer
+                .query_bundle(QUERY_ID)
+                .unwrap()
+                .entities
+                .resources
+                .contains_key(&BUFFER_POOL_MEMORY_ID)
+        );
+    }
+
+    #[test]
+    fn memory_accounts_ignore_operator_selection() {
+        let analyzer = memory_analyzer(true);
+        let accounts = analyzer
+            .list_entities(list_request(MEMORY_ACCOUNT_TYPE_NAME, vec![SOURCE_ID]))
+            .unwrap();
+        assert_eq!(accounts.total, 0);
+
+        let response = analyzer
+            .single_resource_timeline(memory_request(BUFFER_POOL_MEMORY_ID, None, vec![SOURCE_ID]))
+            .unwrap();
+        let UiResourceTimeline::Binned(timeline) = response.data else {
+            panic!("expected plain memory timeline");
+        };
+        let total = timeline
+            .capacities_values
+            .get(MEMORY_BYTES_CAPACITY_NAME)
+            .into_iter()
+            .flatten()
+            .sum::<f64>();
+        assert_eq!(total, 0.0);
+
+        let response = analyzer
+            .single_resource_timeline(memory_request(
+                BUFFER_POOL_MEMORY_ID,
+                Some(MEMORY_ACCOUNT_TYPE_NAME),
+                vec![SOURCE_ID],
+            ))
+            .unwrap();
+        let UiResourceTimeline::BinnedByState(timeline) = response.data else {
+            panic!("expected memory-tag timeline");
+        };
+        let total = timeline
+            .capacities_states_values
+            .get(MEMORY_BYTES_CAPACITY_NAME)
+            .into_iter()
+            .flat_map(|tags| tags.values())
+            .flatten()
+            .sum::<f64>();
+        assert_eq!(total, 0.0);
+    }
+
+    #[test]
+    fn live_memory_accounts_are_closed_for_the_snapshot() {
+        let analyzer = memory_analyzer(false);
+
+        assert!(
+            analyzer
+                .model
+                .memory_accounts
+                .values()
+                .all(MemoryAccountExt::is_complete)
+        );
+        assert!(
+            analyzer
+                .single_resource_timeline(memory_request(BUFFER_POOL_MEMORY_ID, None, vec![]))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn memory_accounts_validate_domain_and_parent() {
+        let mut malformed = memory_accounted(MemoryDomain::BufferPool, 10);
+        malformed.temporary_storage =
+            memory_accounted(MemoryDomain::TemporaryStorage, 20).temporary_storage;
+        let malformed_events = [
+            event(
+                INVALID_MEMORY_ID,
+                112,
+                DuckDBEvent::MemoryAccount(fsm(
+                    0,
+                    memory_account::MemoryAccountTransition::AccountRegistered(
+                        memory_account::AccountRegistered {
+                            instance_name: "malformed".to_owned(),
+                            memory_tag: "HASH_TABLE".to_owned(),
+                        },
+                    ),
+                )),
+            ),
+            event(
+                INVALID_MEMORY_ID,
+                113,
+                DuckDBEvent::MemoryAccount(fsm(
+                    1,
+                    memory_account::MemoryAccountTransition::Accounted(malformed),
+                )),
+            ),
+            event(
+                INVALID_MEMORY_ID,
+                201,
+                DuckDBEvent::MemoryAccount(fsm(2, memory_account::MemoryAccountTransition::Exit)),
+            ),
+        ];
+        let events = base_events()
+            .into_iter()
+            .chain(memory_resource_events(WORKER_ID))
+            .chain(memory_account_events(
+                HASH_TABLE_MEMORY_ID,
+                "HASH_TABLE",
+                MemoryDomain::BufferPool,
+                10,
+                None,
+                true,
+            ))
+            .chain(malformed_events);
+        let analyzer = DuckDbUiAnalyzer::try_new(ENGINE_ID, events).unwrap();
+
+        let response = analyzer
+            .single_resource_timeline(memory_request(BUFFER_POOL_MEMORY_ID, None, vec![]))
+            .unwrap();
+        let UiResourceTimeline::Binned(timeline) = response.data else {
+            panic!("expected plain memory timeline");
+        };
+        let total = timeline
+            .capacities_values
+            .get(MEMORY_BYTES_CAPACITY_NAME)
+            .into_iter()
+            .flatten()
+            .sum::<f64>();
+        assert_eq!(total, 0.0);
+        assert!(
+            !analyzer.model.runtime_resources.resource_types[BUFFER_POOL_MEMORY_TYPE_NAME]
+                .used_by
+                .contains(MEMORY_ACCOUNT_TYPE_NAME)
         );
     }
 

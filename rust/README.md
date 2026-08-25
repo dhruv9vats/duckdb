@@ -11,7 +11,10 @@ reasoning, analyzer guarantees, limitations, and future candidates.
 See [QUERY_COOKBOOK.md](QUERY_COOKBOOK.md) for copy-paste generated-data and
 TPC-H captures that exercise each UI timeline and overlay.
 
-The model contains the standard query-engine entities plus four DuckDB runtime
+See [HANDOFF.md](HANDOFF.md) for the complete implementation context, design
+history, validation state, and proposed `BlockPlacement` design.
+
+The model contains the standard query-engine entities plus five DuckDB runtime
 FSMs:
 
 - `pipeline_task` follows one scheduled pipeline task through running, partial
@@ -22,6 +25,8 @@ FSMs:
   call, including its task, physical operator, row counts, and logical bytes.
 - `temporary_block_io` measures one buffer-manager spill or reload, including
   its causal query, task, operator, memory tag, buffer bytes, and stored bytes.
+- `memory_account` records database-wide buffer-pool, live temporary, and
+  temporary-directory byte occupancy.
 
 Pipeline tasks use the worker's `task_queue` while queued or ready, and both
 tasks and operator invocations use the stable `execution_thread` on which they
@@ -103,8 +108,8 @@ from `QUENT_COLLECTOR_ADDRESS`; the server bind address uses
 `QUENT_COLLECTOR_BIND_ADDRESS`.
 
 Select the `SELECT sum(...)` query and open its **Timeline** tab, or navigate to
-`/profile/engine/{engine_id}/query/{query_id}/timeline`. Expand the `local`
-worker:
+`/profile/engine/{engine_id}/query/{query_id}/timeline`. Expand `local` for
+worker resources:
 
 - `runnable-pipeline-tasks` with `pipeline_task` shows runnable backlog and
   dispatch delay (`Created` and `Ready`). It approximates scheduler occupancy:
@@ -115,6 +120,10 @@ worker:
   (`Running`). Selecting plan operators filters these timelines.
 - `temporary-spill` and `temporary-reload` with `temporary_block_io` show
   temporary-storage operation and buffer-byte rates.
+
+Expand the Engine root for `buffer-pool-memory`, `temporary-storage`, and
+`temporary-directory-storage`. Select `memory_account` to split byte occupancy
+by memory tag.
 
 The execution-thread lanes represent OS threads, not CPU cores. A task may use
 different lanes after yielding. `Blocked` carries no resource usage because a
@@ -130,6 +139,12 @@ The query-plan view also shows a data-flow overlay derived from
 `chunk_transfer` publications. It provides per-operator publication rates for
 chunks, rows, and logical bytes, split by upstream operator. These are logical
 flow rates; they do not represent physical copies or memory bandwidth.
+
+Memory accounts are database-wide and timeline-only. Clear any operator
+selection to view them; DuckDB does not retain query or operator ownership for
+these totals. They measure DuckDB charges, not process RSS. A shared buffer
+pool includes all attached databases. A custom buffer manager bypasses all
+three gauges.
 
 The same timeline can be checked directly. Discover the engine, query group,
 and query, then obtain resource IDs and the query duration from the bundle:

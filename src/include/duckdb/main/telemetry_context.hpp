@@ -20,6 +20,7 @@ class Pipeline;
 class PipelineExecutor;
 class PipelineTask;
 class PhysicalOperator;
+class MemoryUsageProbe;
 class TemporaryIoProbe;
 struct DBConfig;
 enum class TaskExecutionMode : uint8_t;
@@ -34,6 +35,7 @@ public:
 
 	void Initialize(ClientContext &context);
 	shared_ptr<TemporaryIoProbe> TempIoProbe();
+	shared_ptr<duckdb::MemoryUsageProbe> MemoryUsageProbe();
 	static void StartExecution(ClientContext &context, const PhysicalOperator &root);
 #ifdef DUCKDB_QUENT_TELEMETRY
 	static void PipelineTaskCreated(ClientContext &context, const PipelineTask &task, const Pipeline &pipeline);

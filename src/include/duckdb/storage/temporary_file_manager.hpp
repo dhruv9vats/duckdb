@@ -18,6 +18,7 @@
 #include "duckdb/common/time_point.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
+#include "duckdb/storage/memory_usage_probe.hpp"
 
 namespace duckdb {
 
@@ -264,6 +265,8 @@ class TemporaryFileManager {
 
 public:
 	TemporaryFileManager(DatabaseInstance &db, const string &temp_directory_p, atomic<idx_t> &size_on_disk);
+	TemporaryFileManager(DatabaseInstance &db, const string &temp_directory_p, atomic<idx_t> &size_on_disk,
+	                     shared_ptr<MemoryUsageProbe> memory_usage_probe);
 	~TemporaryFileManager();
 
 private:
@@ -338,6 +341,8 @@ private:
 	atomic<idx_t> &size_on_disk;
 	//! The max amount of disk space that can be used
 	idx_t max_swap_space;
+	shared_ptr<MemoryUsageProbe> memory_usage_probe;
+	mutex memory_usage_probe_lock;
 	//! How many compression adaptivities we have so that threads don't all share the same one
 	static constexpr idx_t COMPRESSION_ADAPTIVITIES = 64;
 	//! Class that oversees when/how much to compress
@@ -351,6 +356,8 @@ class TemporaryDirectoryHandle {
 public:
 	TemporaryDirectoryHandle(DatabaseInstance &db, string path_p, atomic<idx_t> &size_on_disk,
 	                         optional_idx max_swap_space);
+	TemporaryDirectoryHandle(DatabaseInstance &db, string path_p, atomic<idx_t> &size_on_disk,
+	                         optional_idx max_swap_space, shared_ptr<MemoryUsageProbe> memory_usage_probe);
 	~TemporaryDirectoryHandle();
 
 public:

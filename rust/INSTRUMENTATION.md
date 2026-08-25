@@ -21,6 +21,11 @@ DatabaseInstance                         Quent Engine
    └─ temporary buffer I/O      TemporaryBlockIo FSM
       ├─ spill                  temporary-spill resource
       └─ reload                 temporary-reload resource
+
+BufferPool / temporary files    MemoryAccount FSM
+├─ charged bytes by tag         buffer-pool-memory resource
+├─ live evicted bytes by tag    temporary-storage resource
+└─ accounted file extent        temporary-directory-storage resource
 ```
 
 The model separates three concerns:
@@ -28,7 +33,7 @@ The model separates three concerns:
 - Query-engine structure: query, plan, operator, port, and edge identity.
 - Runtime work: tasks, operator calls, and chunk publications.
 - Resources: runnable-task backlog, execution threads, and temporary-I/O
-  service paths.
+  service paths, plus database-wide memory and storage occupancy.
 
 Every execution receives new UUIDs. Cached prepared plans are not assigned
 persistent telemetry IDs because the same physical objects may be reused by
@@ -341,6 +346,36 @@ The same block ID may appear in several spill and reload entities. Pairing
 successive operations can suggest repeated eviction or approximate residence,
 but residence is not explicitly modeled.
 
+### MemoryAccount
+
+A `MemoryAccount` is one database-lived absolute occupancy gauge. DuckDB emits:
+
+- one buffer-pool account for each of its 16 accounted memory tags;
+- one live-temporary-storage account for each tag;
+- one `temporary-directory` account tagged `UNKNOWN`.
+
+The 33 accounts follow:
+
+```text
+AccountRegistered → Accounted ↺ → Exit
+```
+
+Every `Accounted` state carries the current byte total and uses exactly one of
+the three memory resources. Storage sends signed deltas; the bridge converts
+them to absolute totals before emitting a state. Buffer-pool registration also
+captures existing charges, so allocations made before probe attachment are not
+lost.
+
+Accounts and resources belong to the database, not a query, task, or operator.
+The analyzer clips their database-wide spans to the selected query window.
+Selecting any physical operator therefore removes these series. This avoids
+inventing ownership that DuckDB does not track.
+
+Memory accounts are timeline-only. They start before query-relative time zero,
+which the current UI entity-list conversion cannot represent as a finite FSM.
+The analyzer still uses them for untyped totals and `memory_account` series
+split by `MemoryTag`.
+
 ## Resources
 
 ### ExecutionThread
@@ -406,6 +441,51 @@ RAM tier <─ reload channel ── temporary-storage tier
 A truthful tier model requires a persistent block-placement lifecycle and
 complete allocation, pin, eviction, reload, deletion, and destruction hooks.
 
+### BufferPoolMemory
+
+`buffer-pool-memory` is DuckDB's managed-memory charge, split by `MemoryTag`.
+The bridge observes the authoritative `BufferPool::UpdateUsedMemory` boundary,
+including reservations made before a physical block exists. Its resource bound
+tracks successful `memory_limit` changes.
+
+This is not process RSS. It excludes stacks, ordinary unmanaged allocations,
+memory-mapped pages, the kernel page cache, and telemetry itself. A charge also
+does not identify a unique buffer, query, or operator. Treat it as the byte
+budget DuckDB's eviction policy sees. If databases share a buffer pool, each
+registered database sees the shared total.
+
+### TemporaryStorage
+
+`temporary-storage` is the live evicted representation, split by the evicted
+block's `MemoryTag`. It rises after a spill and falls on reload or deletion.
+Grouped fixed-size blocks use their compressed temporary size; variable blocks
+use their allocated buffer size.
+
+This is stationary aggregate occupancy, unlike `temporary-spill` and
+`temporary-reload`, which measure active operations and bytes per second. It is
+not filesystem size, device bandwidth, or an ownership claim. Its displayed
+bound follows `max_temp_directory_size` for comparison; DuckDB enforces that
+setting against directory footprint.
+
+### TemporaryDirectoryStorage
+
+`temporary-directory-storage` is DuckDB's accounted temporary-directory file
+extent. It has one `UNKNOWN` account because the file manager no longer retains
+a tag breakdown at this layer. Its bound follows `max_temp_directory_size`.
+
+This gauge can exceed or lag live temporary storage. Grouped files grow and
+shrink in extents, while variable files include headers. Compression and file
+reuse further separate accounted file extent from live logical representations.
+Consequently these are three related, non-equivalent quantities:
+
+```text
+buffer-pool charge  ≠  live evicted representations  ≠  directory extent
+```
+
+None is RSS. Do not add temporary-storage tags and expect the directory gauge,
+or subtract either temporary gauge from buffer-pool usage to infer a block's
+placement.
+
 ## DuckDB memory semantics
 
 ### DataChunk is an execution batch, not a placement
@@ -435,7 +515,7 @@ DuckDB's managed-memory layer is block based:
 - destroyable intermediates may be discarded permanently.
 - non-destroyable temporary blocks are written before unload.
 
-The buffer pool accounts resident bytes by `MemoryTag`, but does not retain
+The buffer pool accounts managed charges by `MemoryTag`, but does not retain
 universal query or operator ownership. A `QueryContext` passed to eviction
 identifies the claimant that needed memory, not necessarily the victim's owner.
 
@@ -465,8 +545,8 @@ The DuckDB model follows the same Quent contracts but not every Sirius mapping.
 
 ## Analyzer contract
 
-The analyzer reconstructs standard query-engine declarations, the four runtime
-FSM collections, and runtime resources from one engine event stream.
+The analyzer reconstructs standard query-engine declarations, five runtime FSM
+collections, and resources from one engine event stream.
 
 Before an entity affects UI output, the analyzer validates relevant joins:
 
@@ -475,6 +555,7 @@ Before an entity affects UI output, the analyzer validates relevant joins:
 - task membership and task-to-operator containment;
 - port ownership and declared plan edges;
 - resource type and worker parent;
+- one stable Engine-parent memory resource per account;
 - terminal FSM completion.
 
 Invalid or incomplete runtime entities remain importable but are excluded from
@@ -516,6 +597,8 @@ initializing Quent UI selector without accepting unknown named types.
 
 Operator filters use pipeline containment for tasks, exact operator identity
 for invocations, and causal trigger identity for temporary I/O.
+`memory_account` is intentionally timeline-only because its Engine lifetime
+starts before every query epoch.
 
 ### Resource timelines
 
@@ -524,7 +607,13 @@ Single and bulk timelines support:
 - task queue by `pipeline_task` state;
 - execution thread by `pipeline_task` or `operator_invocation` state;
 - temporary spill/reload by `temporary_block_io` state;
+- buffer-pool, live temporary, and directory bytes by `memory_account` tag;
 - worker aggregation across resources of a selected type.
+
+The analyzer reconstructs successful limit changes, but the current Quent
+query bundle does not expose resource-capacity history. The UI shows absolute
+bytes, not a limit line or utilization percentage. The tagged view also keeps
+unused tags as zero-valued series.
 
 Unfiltered execution-thread aggregation uses tasks as the canonical physical
 occupancy layer so nested operator spans do not consume two units.
@@ -553,6 +642,8 @@ currently a Rust library method rather than a separate HTTP endpoint.
 - Which operator triggered temporary spilling or reloading?
 - How many temporary operations overlapped, and at what effective rate?
 - Which memory tags and blocks generated temporary traffic?
+- Which tags consumed DuckDB's managed-memory budget over time?
+- How much live evicted data and temporary file extent existed concurrently?
 - How do task, operator, dataflow, and temporary-I/O intervals correlate?
 
 ## What it cannot yet answer
@@ -560,11 +651,11 @@ currently a Rust library method rather than a separate HTTP endpoint.
 - Exact CPU time or whole-system CPU utilization.
 - Exact scheduler queue contents or configured-slot utilization percentage.
 - Why a task blocked.
-- Unique resident bytes owned by a query or operator.
+- Unique resident bytes owned by a query, operator, or block.
 - Zero-copy versus copied chunk publications.
 - Stable batch lineage through split, merge, reference, and fan-out.
 - Downstream chunk acceptance or edge latency.
-- RAM or temporary-storage occupancy over time.
+- Per-block RAM versus temporary-storage placement over time.
 - Persistent-database, remote-object-store, or kernel-cache I/O.
 - Complete pipeline dependency and barrier timing.
 
@@ -575,6 +666,9 @@ currently a Rust library method rather than a separate HTTP endpoint.
 Model a stable block placement with states such as Loaded, Pinned, Unpinned,
 Spilling, Spilled, Reloading, and Destroyed. Attach stationary states to RAM or
 temporary-storage tier byte occupancy and transition states to I/O channels.
+
+The aggregate gauges now provide reconciliation totals. They still cannot say
+which block occupied either tier, how long it stayed there, or who owned it.
 
 This is the natural complement to `TemporaryBlockIo`, but ownership must remain
 unknown unless DuckDB adds explicit block provenance.
@@ -640,7 +734,7 @@ unbounded asynchronous channel. Production deployment needs bounded loss
 accounting, sampling, or windowed aggregation before enabling this detail by
 default.
 
-Storage telemetry is fail-open. The storage layer depends only on
-`TemporaryIoProbe`; generated Quent types stay in the main telemetry layer.
-Custom `DBConfig.buffer_manager` implementations bypass the standard-buffer
-manager probe.
+Storage telemetry is fail-open. The storage layer depends only on probe
+abstractions; generated Quent types stay in the main telemetry layer. Custom
+`DBConfig.buffer_manager` implementations bypass temporary I/O and all three
+memory gauges.

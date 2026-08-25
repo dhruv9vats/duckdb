@@ -46,7 +46,8 @@ query. Select the final query named in each section, not a preceding `SET` or
 
 ## UI checklist
 
-Open the selected query's Timeline page and expand its `local` worker.
+Open the selected query's Timeline page. Expand `local` for worker resources
+and the Engine root for memory resources.
 
 | UI selection | Expected meaning |
 |---|---|
@@ -55,11 +56,16 @@ Open the selected query's Timeline page and expand its `local` worker.
 | `thread-*` + `operator_invocation` | Exact physical-operator calls |
 | `temporary-spill` + `temporary_block_io` | Spill operations/s and buffer B/s |
 | `temporary-reload` + `temporary_block_io` | Reload operations/s and buffer B/s |
+| `buffer-pool-memory` + `memory_account` | Managed bytes by `MemoryTag` |
+| `temporary-storage` + `memory_account` | Live evicted bytes by `MemoryTag` |
+| `temporary-directory-storage` + `memory_account` | Accounted temporary-file bytes |
 | Plan dataflow overlay | Published chunks, rows, and logical bytes/s |
 
 Selecting a physical operator filters these views. A task is included when its
 pipeline contains the selected operator. Operator invocations use exact
 operator identity. Temporary I/O uses causal `trigger_operator_id`.
+The three memory resources are database-wide and disappear under any operator
+selection. A shared buffer pool includes activity from every attached database.
 
 ## Recommended generated workload: everything at once
 
@@ -229,12 +235,13 @@ Select the final `SELECT d.region ...` query. Select `SEQ_SCAN` to see several
 tasks, then `HASH_JOIN` or `HASH_GROUP_BY` for exact invocation spans. The
 number of active threads may be below four; `SET threads=4` is a limit.
 
-## Generated workload 2: spill and reload
+## Generated workload 2: spill, reload, and memory occupancy
 
 Purpose:
 
 - `TemporaryBlockIo` spill and reload entities;
 - `temporary-spill` and `temporary-reload` rate resources;
+- buffer-pool, live temporary, and directory occupancy resources;
 - causal task and `HASH_JOIN` attribution;
 - memory-tag and stored-size attributes.
 
@@ -254,6 +261,7 @@ SET threads=4;
 SET scheduler_process_partial=true;
 SET memory_limit='128MB';
 SET temp_directory='$spill_dir';
+SET max_temp_directory_size='1GB';
 SET preserve_insertion_order=false;
 SET debug_force_external=true;
 
@@ -271,8 +279,32 @@ Select the final join. Expand both temporary-I/O resources and choose
 attributed I/O; selecting `RESULT_COLLECTOR` should produce an empty I/O
 series.
 
+At the Engine root, inspect `buffer-pool-memory`, `temporary-storage`, and
+`temporary-directory-storage`. Choose `memory_account` to split occupancy by
+tag. The first two show `HASH_TABLE` and `COLUMN_DATA`; the directory resource
+has one `UNKNOWN` series. Clear the operator selection: these gauges are
+database-wide and intentionally have no operator attribution.
+
+In one validated run, the target took 0.519 seconds and the 58 MB capture held
+24,960 memory-account events and 2,656 temporary-I/O events. Binned peaks were
+approximately:
+
+| Resource | Tag | Peak |
+|---|---|---:|
+| Buffer pool | `HASH_TABLE` | 121.24 MiB |
+| Buffer pool | `COLUMN_DATA` | 102.27 MiB |
+| Buffer pool | `ALLOCATOR` | 9.40 MiB |
+| Live temporary storage | `HASH_TABLE` | 107.47 MiB |
+| Live temporary storage | `COLUMN_DATA` | 69.44 MiB |
+| Temporary directory | `UNKNOWN` | 176.91 MiB |
+
+The values need not match. Buffer-pool charge, live evicted representations,
+and DuckDB-accounted file extent are separate gauges. The first pair are split
+by tag; only directory extent is charged directly against the 1 GB swap limit.
+
 The source `range()` scans may remain serial. This workload targets temporary
-I/O, not maximum scan parallelism.
+I/O and memory pressure, not maximum scan parallelism. The temporary-I/O lanes
+show operation and byte rates; the three memory lanes show byte occupancy.
 
 ## Generated workload 3: runtime failure
 
@@ -552,7 +584,10 @@ reload resources. Counts vary by build and scheduling.
 
 Runtime telemetry is deliberately fine-grained. One vectorized operator call
 creates an `OperatorInvocation`; every nonempty plan-edge output creates a
-`ChunkTransfer`; every temporary operation creates four events.
+`ChunkTransfer`; every temporary operation creates four events. Each managed
+memory charge, spill, reload, or deletion also advances an absolute
+`MemoryAccount` gauge. Memory events can therefore be a material share of a
+low-memory capture.
 
 For a smaller first run:
 

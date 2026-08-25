@@ -3,10 +3,12 @@
 #ifdef DUCKDB_QUENT_TELEMETRY
 
 #include "duckdb-telemetry-bridge/gen/context.rs.h"
+#include "duckdb-telemetry-bridge/gen/buffer_pool_memory.rs.h"
 #include "duckdb-telemetry-bridge/gen/chunk_transfer.rs.h"
 #include "duckdb-telemetry-bridge/gen/engine.rs.h"
 #include "duckdb-telemetry-bridge/gen/operator.rs.h"
 #include "duckdb-telemetry-bridge/gen/operator_invocation.rs.h"
+#include "duckdb-telemetry-bridge/gen/memory_account.rs.h"
 #include "duckdb-telemetry-bridge/gen/pipeline_task.rs.h"
 #include "duckdb-telemetry-bridge/gen/plan.rs.h"
 #include "duckdb-telemetry-bridge/gen/port.rs.h"
@@ -15,7 +17,9 @@
 #include "duckdb-telemetry-bridge/gen/execution_thread.rs.h"
 #include "duckdb-telemetry-bridge/gen/task_queue.rs.h"
 #include "duckdb-telemetry-bridge/gen/temporary_block_io.rs.h"
+#include "duckdb-telemetry-bridge/gen/temporary_directory_storage.rs.h"
 #include "duckdb-telemetry-bridge/gen/temporary_io_channel.rs.h"
+#include "duckdb-telemetry-bridge/gen/temporary_storage.rs.h"
 #include "duckdb-telemetry-bridge/gen/uuid.rs.h"
 #include "duckdb-telemetry-bridge/gen/worker.rs.h"
 
@@ -38,6 +42,7 @@
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/storage/memory_usage_probe.hpp"
 #include "duckdb/storage/temporary_io_probe.hpp"
 
 namespace duckdb {
@@ -50,8 +55,14 @@ static constexpr const char *DEFAULT_OUTPUT_DIR = "events";
 static constexpr const char *DEFAULT_COLLECTOR_ADDRESS = "http://localhost:7836";
 static constexpr const char *TEMP_SPILL_NAME = "temporary-spill";
 static constexpr const char *TEMP_RELOAD_NAME = "temporary-reload";
+static constexpr const char *BUFFER_POOL_MEMORY_NAME = "buffer-pool-memory";
+static constexpr const char *TEMP_STORAGE_NAME = "temporary-storage";
+static constexpr const char *TEMP_DIRECTORY_STORAGE_NAME = "temporary-directory-storage";
+static constexpr const char *TEMP_DIRECTORY_ACCOUNT_NAME = "temporary-directory";
+static constexpr const char *TEMP_DIRECTORY_ACCOUNT_TAG = "UNKNOWN";
 
 enum class TelemetryIoOutcome : uint8_t { SUCCESS, FAILURE };
+enum class MemoryTelemetryMode : uint8_t { ENABLED, DISABLED };
 
 static const char *OperatorPhaseName(TelemetryOperatorPhase phase) {
 	switch (phase) {
@@ -180,6 +191,11 @@ struct InvocationTelemetry {
 
 	rust::Box<quent::operator_invocation::OperatorInvocationHandle> handle;
 	uuid::UUID task_id;
+};
+
+struct MemoryAccountTelemetry {
+	optional<rust::Box<quent::memory_account::MemoryAccountHandle>> handle;
+	uint64_t bytes = 0;
 };
 
 struct IoAttribution {
@@ -337,6 +353,8 @@ static rust::Box<quent::ExporterOptions> CreateExporter(const string &name) {
 }
 
 class TelemetryContext::Impl {
+	friend class TelemetryContext;
+
 public:
 	class ClientState : public ClientContextState {
 	public:
@@ -748,7 +766,70 @@ public:
 		}
 	};
 
-	Impl(rust::Box<quent::ExporterOptions> exporter, const string &instance_name)
+	class MemoryProbe final : public MemoryUsageProbe {
+	public:
+		explicit MemoryProbe(const shared_ptr<Impl> &telemetry_p) : telemetry(telemetry_p) {
+		}
+
+		void BufferPoolSnapshot(MemoryTag tag, idx_t bytes) noexcept override {
+			try {
+				if (auto target = telemetry.lock()) {
+					target->SetBufferPoolUsage(tag, bytes);
+				}
+			} catch (...) {
+			}
+		}
+
+		void BufferPoolDelta(MemoryTag tag, int64_t bytes) noexcept override {
+			try {
+				if (auto target = telemetry.lock()) {
+					target->ChangeBufferPoolUsage(tag, bytes);
+				}
+			} catch (...) {
+			}
+		}
+
+		void BufferPoolLimit(idx_t bytes) noexcept override {
+			try {
+				if (auto target = telemetry.lock()) {
+					target->ResizeBufferPool(bytes);
+				}
+			} catch (...) {
+			}
+		}
+
+		void TemporaryStorageDelta(MemoryTag tag, int64_t bytes) noexcept override {
+			try {
+				if (auto target = telemetry.lock()) {
+					target->ChangeTempStorage(tag, bytes);
+				}
+			} catch (...) {
+			}
+		}
+
+		void TemporaryStorageLimit(optional_idx bytes) noexcept override {
+			try {
+				if (auto target = telemetry.lock()) {
+					target->ResizeTempStorage(bytes);
+				}
+			} catch (...) {
+			}
+		}
+
+		void TemporaryDirectoryDelta(int64_t bytes) noexcept override {
+			try {
+				if (auto target = telemetry.lock()) {
+					target->ChangeTempDirectory(bytes);
+				}
+			} catch (...) {
+			}
+		}
+
+	private:
+		weak_ptr<Impl> telemetry;
+	};
+
+	Impl(rust::Box<quent::ExporterOptions> exporter, const string &instance_name, MemoryTelemetryMode memory_mode)
 	    : engine_id(uuid::now_v7()), worker_id(uuid::now_v7()), context(quent::create_context(std::move(exporter))),
 	      engine_observer(quent::engine::create_observer(*context)),
 	      worker_observer(quent::worker::create_observer(*context)),
@@ -774,6 +855,9 @@ public:
 
 		temp_spill_channel.emplace(CreateIoChannel(TEMP_SPILL_NAME));
 		temp_reload_channel.emplace(CreateIoChannel(TEMP_RELOAD_NAME));
+		if (memory_mode == MemoryTelemetryMode::ENABLED) {
+			InitializeMemoryResources();
+		}
 	}
 
 	~Impl() {
@@ -781,12 +865,13 @@ public:
 	}
 
 	void Exit() {
-		if (exited) {
-			return;
-		}
-		exited = true;
 		{
 			lock_guard<mutex> guard(resource_lock);
+			if (exited) {
+				return;
+			}
+			exited = true;
+
 			for (auto &entry : execution_threads) {
 				entry.second->finalizing();
 				entry.second->exit();
@@ -808,6 +893,7 @@ public:
 			};
 			exit_channel(temp_spill_channel);
 			exit_channel(temp_reload_channel);
+			ExitMemoryResources();
 		}
 		worker_observer->exit(worker_id);
 		engine_observer->exit(engine_id);
@@ -849,6 +935,10 @@ public:
 	}
 
 private:
+	bool MemoryEnabled() const {
+		return buffer_pool_memory.has_value();
+	}
+
 	rust::Box<quent::temporary_io_channel::TemporaryIoChannelHandle> CreateIoChannel(const char *name) {
 		quent::temporary_io_channel::Initializing initializing;
 		initializing.instance_name = name;
@@ -862,6 +952,19 @@ private:
 		return handle;
 	}
 
+	void InitializeMemoryResources();
+	void UpdateBufferAccount(MemoryTag tag);
+	void UpdateTempAccount(MemoryTag tag);
+	void UpdateDirectoryAccount();
+	void ExitMemoryResources();
+	void SetBufferPoolUsage(MemoryTag tag, idx_t bytes);
+	void ChangeBufferPoolUsage(MemoryTag tag, int64_t bytes);
+	void ResizeBufferPool(idx_t bytes);
+	void ChangeTempStorage(MemoryTag tag, int64_t bytes);
+	void ResizeTempStorage(optional_idx bytes);
+	void ChangeTempDirectory(int64_t bytes);
+	static void ApplyDelta(uint64_t &current, int64_t delta) noexcept;
+
 private:
 	uuid::UUID engine_id;
 	uuid::UUID worker_id;
@@ -872,10 +975,222 @@ private:
 	optional<rust::Box<quent::task_queue::TaskQueueHandle>> task_queue;
 	optional<rust::Box<quent::temporary_io_channel::TemporaryIoChannelHandle>> temp_spill_channel;
 	optional<rust::Box<quent::temporary_io_channel::TemporaryIoChannelHandle>> temp_reload_channel;
+	optional<rust::Box<quent::buffer_pool_memory::BufferPoolMemoryHandle>> buffer_pool_memory;
+	optional<rust::Box<quent::temporary_storage::TemporaryStorageHandle>> temporary_storage;
+	optional<rust::Box<quent::temporary_directory_storage::TemporaryDirectoryStorageHandle>>
+	    temporary_directory_storage;
+	array<MemoryAccountTelemetry, MEMORY_TAG_COUNT> buffer_pool_accounts;
+	array<MemoryAccountTelemetry, MEMORY_TAG_COUNT> temporary_storage_accounts;
+	MemoryAccountTelemetry temporary_directory_account;
 	unordered_map<string, rust::Box<quent::execution_thread::ExecutionThreadHandle>> execution_threads;
 	mutex resource_lock;
 	bool exited = false;
 };
+
+void TelemetryContext::Impl::InitializeMemoryResources() {
+	quent::buffer_pool_memory::Initializing buffer_pool_initializing;
+	buffer_pool_initializing.instance_name = BUFFER_POOL_MEMORY_NAME;
+	buffer_pool_initializing.parent_group_id = engine_id;
+	buffer_pool_memory.emplace(quent::buffer_pool_memory::create(*context, std::move(buffer_pool_initializing)));
+	quent::buffer_pool_memory::Operating buffer_pool_operating;
+	buffer_pool_operating.capacity_bytes = NumericLimits<uint64_t>::Maximum();
+	(*buffer_pool_memory)->operating(std::move(buffer_pool_operating));
+
+	quent::temporary_storage::Initializing temporary_storage_initializing;
+	temporary_storage_initializing.instance_name = TEMP_STORAGE_NAME;
+	temporary_storage_initializing.parent_group_id = engine_id;
+	temporary_storage.emplace(quent::temporary_storage::create(*context, std::move(temporary_storage_initializing)));
+	quent::temporary_storage::Operating temporary_storage_operating;
+	temporary_storage_operating.capacity_bytes = NumericLimits<uint64_t>::Maximum();
+	(*temporary_storage)->operating(std::move(temporary_storage_operating));
+
+	quent::temporary_directory_storage::Initializing temporary_directory_initializing;
+	temporary_directory_initializing.instance_name = TEMP_DIRECTORY_STORAGE_NAME;
+	temporary_directory_initializing.parent_group_id = engine_id;
+	temporary_directory_storage.emplace(
+	    quent::temporary_directory_storage::create(*context, std::move(temporary_directory_initializing)));
+	quent::temporary_directory_storage::Operating temporary_directory_operating;
+	temporary_directory_operating.capacity_bytes = NumericLimits<uint64_t>::Maximum();
+	(*temporary_directory_storage)->operating(std::move(temporary_directory_operating));
+
+	for (idx_t tag_index = 0; tag_index < MEMORY_TAG_COUNT; tag_index++) {
+		auto tag = MemoryTag(tag_index);
+		auto tag_name = EnumUtil::ToString(tag);
+
+		quent::memory_account::AccountRegistered buffer_registered;
+		buffer_registered.instance_name = string(BUFFER_POOL_MEMORY_NAME) + "-" + tag_name;
+		buffer_registered.memory_tag = tag_name;
+		buffer_pool_accounts[tag_index].handle.emplace(
+		    quent::memory_account::create(*context, std::move(buffer_registered)));
+		UpdateBufferAccount(tag);
+
+		quent::memory_account::AccountRegistered temporary_registered;
+		temporary_registered.instance_name = string(TEMP_STORAGE_NAME) + "-" + tag_name;
+		temporary_registered.memory_tag = tag_name;
+		temporary_storage_accounts[tag_index].handle.emplace(
+		    quent::memory_account::create(*context, std::move(temporary_registered)));
+		UpdateTempAccount(tag);
+	}
+
+	quent::memory_account::AccountRegistered directory_registered;
+	directory_registered.instance_name = TEMP_DIRECTORY_ACCOUNT_NAME;
+	directory_registered.memory_tag = TEMP_DIRECTORY_ACCOUNT_TAG;
+	temporary_directory_account.handle.emplace(
+	    quent::memory_account::create(*context, std::move(directory_registered)));
+	UpdateDirectoryAccount();
+}
+
+void TelemetryContext::Impl::UpdateBufferAccount(MemoryTag tag) {
+	auto &account = buffer_pool_accounts[uint8_t(tag)];
+	D_ASSERT(account.handle);
+	D_ASSERT(buffer_pool_memory);
+
+	quent::memory_account::Accounted accounted;
+	accounted.buffer_pool_resource_id = (*buffer_pool_memory)->uuid();
+	accounted.buffer_pool_capacity_bytes = account.bytes;
+	accounted.temporary_storage_resource_id = uuid::new_nil();
+	accounted.temporary_directory_resource_id = uuid::new_nil();
+	(*account.handle)->accounted(std::move(accounted));
+}
+
+void TelemetryContext::Impl::UpdateTempAccount(MemoryTag tag) {
+	auto &account = temporary_storage_accounts[uint8_t(tag)];
+	D_ASSERT(account.handle);
+	D_ASSERT(temporary_storage);
+
+	quent::memory_account::Accounted accounted;
+	accounted.buffer_pool_resource_id = uuid::new_nil();
+	accounted.temporary_storage_resource_id = (*temporary_storage)->uuid();
+	accounted.temporary_storage_capacity_bytes = account.bytes;
+	accounted.temporary_directory_resource_id = uuid::new_nil();
+	(*account.handle)->accounted(std::move(accounted));
+}
+
+void TelemetryContext::Impl::UpdateDirectoryAccount() {
+	D_ASSERT(temporary_directory_account.handle);
+	D_ASSERT(temporary_directory_storage);
+
+	quent::memory_account::Accounted accounted;
+	accounted.buffer_pool_resource_id = uuid::new_nil();
+	accounted.temporary_storage_resource_id = uuid::new_nil();
+	accounted.temporary_directory_resource_id = (*temporary_directory_storage)->uuid();
+	accounted.temporary_directory_capacity_bytes = temporary_directory_account.bytes;
+	(*temporary_directory_account.handle)->accounted(std::move(accounted));
+}
+
+void TelemetryContext::Impl::SetBufferPoolUsage(MemoryTag tag, idx_t bytes) {
+	lock_guard<mutex> guard(resource_lock);
+	if (exited) {
+		return;
+	}
+
+	buffer_pool_accounts[uint8_t(tag)].bytes = bytes;
+	UpdateBufferAccount(tag);
+}
+
+void TelemetryContext::Impl::ChangeBufferPoolUsage(MemoryTag tag, int64_t bytes) {
+	lock_guard<mutex> guard(resource_lock);
+	if (exited) {
+		return;
+	}
+
+	auto &account = buffer_pool_accounts[uint8_t(tag)];
+	ApplyDelta(account.bytes, bytes);
+	UpdateBufferAccount(tag);
+}
+
+void TelemetryContext::Impl::ResizeBufferPool(idx_t bytes) {
+	lock_guard<mutex> guard(resource_lock);
+	if (exited || !buffer_pool_memory) {
+		return;
+	}
+
+	(*buffer_pool_memory)->resizing();
+	quent::buffer_pool_memory::Operating operating;
+	operating.capacity_bytes = bytes;
+	(*buffer_pool_memory)->operating(std::move(operating));
+}
+
+void TelemetryContext::Impl::ChangeTempStorage(MemoryTag tag, int64_t bytes) {
+	lock_guard<mutex> guard(resource_lock);
+	if (exited) {
+		return;
+	}
+
+	auto &account = temporary_storage_accounts[uint8_t(tag)];
+	ApplyDelta(account.bytes, bytes);
+	UpdateTempAccount(tag);
+}
+
+void TelemetryContext::Impl::ResizeTempStorage(optional_idx bytes) {
+	lock_guard<mutex> guard(resource_lock);
+	if (exited || !temporary_storage || !temporary_directory_storage) {
+		return;
+	}
+
+	auto capacity = bytes.IsValid() ? bytes.GetIndex() : NumericLimits<uint64_t>::Maximum();
+	(*temporary_storage)->resizing();
+	quent::temporary_storage::Operating temporary_operating;
+	temporary_operating.capacity_bytes = capacity;
+	(*temporary_storage)->operating(std::move(temporary_operating));
+
+	(*temporary_directory_storage)->resizing();
+	quent::temporary_directory_storage::Operating directory_operating;
+	directory_operating.capacity_bytes = capacity;
+	(*temporary_directory_storage)->operating(std::move(directory_operating));
+}
+
+void TelemetryContext::Impl::ChangeTempDirectory(int64_t bytes) {
+	lock_guard<mutex> guard(resource_lock);
+	if (exited) {
+		return;
+	}
+
+	ApplyDelta(temporary_directory_account.bytes, bytes);
+	UpdateDirectoryAccount();
+}
+
+void TelemetryContext::Impl::ApplyDelta(uint64_t &current, int64_t delta) noexcept {
+	if (delta >= 0) {
+		current += static_cast<uint64_t>(delta);
+		return;
+	}
+
+	auto decrease = static_cast<uint64_t>(-(delta + 1)) + 1;
+	D_ASSERT(current >= decrease);
+	current = current >= decrease ? current - decrease : 0;
+}
+
+void TelemetryContext::Impl::ExitMemoryResources() {
+	auto exit_account = [](auto &account) {
+		if (!account.handle) {
+			return;
+		}
+
+		(*account.handle)->exit();
+		account.handle.reset();
+	};
+	for (auto &account : buffer_pool_accounts) {
+		exit_account(account);
+	}
+	for (auto &account : temporary_storage_accounts) {
+		exit_account(account);
+	}
+	exit_account(temporary_directory_account);
+
+	auto exit_resource = [](auto &resource) {
+		if (!resource) {
+			return;
+		}
+
+		(*resource)->finalizing();
+		(*resource)->exit();
+		resource.reset();
+	};
+	exit_resource(buffer_pool_memory);
+	exit_resource(temporary_storage);
+	exit_resource(temporary_directory_storage);
+}
 
 TelemetryContext::TelemetryContext(DBConfig &config) {
 	auto exporter = StringUtil::Lower(FileSystem::GetEnvVariable(EXPORTER_ENV));
@@ -883,7 +1198,8 @@ TelemetryContext::TelemetryContext(DBConfig &config) {
 		return;
 	}
 	auto instance_name = config.options.database_path.empty() ? string(":memory:") : config.options.database_path;
-	impl = make_shared_ptr<Impl>(CreateExporter(exporter), instance_name);
+	auto memory_mode = config.buffer_manager ? MemoryTelemetryMode::DISABLED : MemoryTelemetryMode::ENABLED;
+	impl = make_shared_ptr<Impl>(CreateExporter(exporter), instance_name, memory_mode);
 }
 
 TelemetryContext::~TelemetryContext() {
@@ -903,6 +1219,13 @@ shared_ptr<TemporaryIoProbe> TelemetryContext::TempIoProbe() {
 		return nullptr;
 	}
 	return make_shared_ptr<Impl::TempIoProbe>();
+}
+
+shared_ptr<duckdb::MemoryUsageProbe> TelemetryContext::MemoryUsageProbe() {
+	if (!impl || !impl->MemoryEnabled()) {
+		return nullptr;
+	}
+	return make_shared_ptr<Impl::MemoryProbe>(impl);
 }
 
 void TelemetryContext::StartExecution(ClientContext &context, const PhysicalOperator &root) {
@@ -1025,6 +1348,10 @@ void TelemetryContext::Initialize(ClientContext &) {
 }
 
 shared_ptr<TemporaryIoProbe> TelemetryContext::TempIoProbe() {
+	return nullptr;
+}
+
+shared_ptr<duckdb::MemoryUsageProbe> TelemetryContext::MemoryUsageProbe() {
 	return nullptr;
 }
 

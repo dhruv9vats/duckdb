@@ -15,6 +15,7 @@
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/storage/buffer/block_handle.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
+#include "duckdb/storage/memory_usage_probe.hpp"
 #include "duckdb/storage/temporary_io_probe.hpp"
 
 namespace duckdb {
@@ -38,6 +39,8 @@ class StandardBufferManager : public BufferManager {
 public:
 	StandardBufferManager(DatabaseInstance &db, string temp_directory);
 	StandardBufferManager(DatabaseInstance &db, string temp_directory, shared_ptr<TemporaryIoProbe> temporary_io_probe);
+	StandardBufferManager(DatabaseInstance &db, string temp_directory, shared_ptr<TemporaryIoProbe> temporary_io_probe,
+	                      shared_ptr<MemoryUsageProbe> memory_usage_probe);
 	~StandardBufferManager() override;
 
 public:
@@ -204,6 +207,13 @@ protected:
 	DatabaseInstance &db;
 	//! The buffer pool
 	BufferPool &buffer_pool;
+
+private:
+	shared_ptr<TemporaryIoProbe> temporary_io_probe;
+	shared_ptr<MemoryUsageProbe> memory_usage_probe;
+	mutex memory_usage_probe_lock;
+
+protected:
 	//! The variables related to temporary file management
 	TemporaryFileData temporary_directory;
 	//! The temporary id used for managed buffers
@@ -218,8 +228,7 @@ protected:
 private:
 	unique_ptr<TemporaryIoEvent> StartTempIo(QueryContext context, TemporaryIoDirection direction, block_id_t block_id,
 	                                         MemoryTag tag, idx_t buffer_bytes);
-
-	shared_ptr<TemporaryIoProbe> temporary_io_probe;
+	void UpdateTemporaryStorage(MemoryTag tag, int64_t bytes);
 };
 
 } // namespace duckdb

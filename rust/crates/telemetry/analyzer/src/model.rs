@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use duckdb_telemetry_model::{DuckDBEvent, runtime_resource};
+use duckdb_telemetry_model::{DuckDBEvent, memory_account, runtime_resource};
 use quent_analyzer::{
     AnalyzerError, AnalyzerResult, Entity, Model,
     resource::{
@@ -14,6 +14,7 @@ use quent_analyzer::{
     },
 };
 use quent_events::Event;
+use quent_model::FsmEvent;
 use quent_query_engine_analyzer::{
     OperatorEntity, OperatorEntityMut, PlanEntity, QueryEngineModel,
     plain::legacy::{
@@ -28,6 +29,7 @@ use uuid::Uuid;
 
 use crate::{
     chunk_transfer::{ChunkTransfer, ChunkTransferBuilder},
+    memory_account::{MemoryAccount, MemoryAccountBuilder, MemoryAccountExt},
     operator_invocation::{OperatorInvocation, OperatorInvocationBuilder, OperatorInvocationExt},
     pipeline_task::{PipelineTask, PipelineTaskBuilder, PipelineTaskExt, task_plan_id},
     temporary_block_io::{TemporaryBlockIo, TemporaryBlockIoBuilder, TemporaryBlockIoExt},
@@ -39,6 +41,10 @@ pub(crate) const QUEUE_ENTRIES_CAPACITY_NAME: &str = "capacity_entries";
 pub(crate) const TEMPORARY_IO_CHANNEL_TYPE_NAME: &str = "temporary_io_channel";
 pub(crate) const IO_OPERATIONS_CAPACITY_NAME: &str = "capacity_operations";
 pub(crate) const IO_BUFFER_BYTES_CAPACITY_NAME: &str = "capacity_buffer_bytes";
+pub(crate) const MEMORY_BYTES_CAPACITY_NAME: &str = "capacity_bytes";
+pub(crate) const BUFFER_POOL_MEMORY_TYPE_NAME: &str = "buffer_pool_memory";
+pub(crate) const TEMPORARY_STORAGE_TYPE_NAME: &str = "temporary_storage";
+pub(crate) const TEMPORARY_DIRECTORY_STORAGE_TYPE_NAME: &str = "temporary_directory_storage";
 
 fn validate_resource_type(actual: &str, expected: &str, id: Uuid) -> AnalyzerResult<()> {
     if actual == expected {
@@ -72,6 +78,19 @@ fn insert_resource_types(resources: &mut InMemoryResources) {
             ],
         ),
     );
+    for type_name in [
+        BUFFER_POOL_MEMORY_TYPE_NAME,
+        TEMPORARY_STORAGE_TYPE_NAME,
+        TEMPORARY_DIRECTORY_STORAGE_TYPE_NAME,
+    ] {
+        resources.resource_types.insert(
+            type_name.to_owned(),
+            ResourceTypeDecl::new(
+                type_name,
+                [CapacityDecl::new_occupancy(MEMORY_BYTES_CAPACITY_NAME)],
+            ),
+        );
+    }
 }
 
 pub struct DuckDbModel {
@@ -81,6 +100,7 @@ pub struct DuckDbModel {
     pub(crate) chunk_transfers: HashMap<Uuid, ChunkTransfer>,
     pub(crate) operator_invocations: HashMap<Uuid, OperatorInvocation>,
     pub(crate) temporary_block_ios: HashMap<Uuid, TemporaryBlockIo>,
+    pub(crate) memory_accounts: HashMap<Uuid, MemoryAccount>,
     pub(crate) resource_group_types: HashMap<String, ResourceGroupTypeDecl>,
 }
 
@@ -113,7 +133,8 @@ impl Model for DuckDbModel {
 
         (self.pipeline_tasks.contains_key(&entity_id)
             || self.operator_invocations.contains_key(&entity_id)
-            || self.temporary_block_ios.contains_key(&entity_id))
+            || self.temporary_block_ios.contains_key(&entity_id)
+            || self.memory_accounts.contains_key(&entity_id))
         .then_some(EntityRef::Task(entity_id))
         .ok_or(AnalyzerError::InvalidId(entity_id))
     }
@@ -269,6 +290,9 @@ pub(crate) struct DuckDbModelBuilder {
     chunk_transfers: HashMap<Uuid, ChunkTransferBuilder>,
     operator_invocations: HashMap<Uuid, OperatorInvocationBuilder>,
     temporary_block_ios: HashMap<Uuid, TemporaryBlockIoBuilder>,
+    memory_accounts: HashMap<Uuid, MemoryAccountBuilder>,
+    active_memory_accounts: HashSet<Uuid>,
+    initializing_runtime_resources: HashSet<Uuid>,
     active_runtime_resources: HashSet<Uuid>,
     finalizing_runtime_resources: HashSet<Uuid>,
     engine_active: bool,
@@ -286,6 +310,9 @@ impl DuckDbModelBuilder {
             chunk_transfers: HashMap::new(),
             operator_invocations: HashMap::new(),
             temporary_block_ios: HashMap::new(),
+            memory_accounts: HashMap::new(),
+            active_memory_accounts: HashSet::new(),
+            initializing_runtime_resources: HashSet::new(),
             active_runtime_resources: HashSet::new(),
             finalizing_runtime_resources: HashSet::new(),
             engine_active: false,
@@ -334,10 +361,33 @@ impl DuckDbModelBuilder {
                 builder.push(Event::new(id, timestamp, event));
                 Ok(())
             }
+            DuckDBEvent::MemoryAccount(event) => {
+                let is_exit = matches!(&event.state, memory_account::MemoryAccountTransition::Exit);
+                let builder = self
+                    .memory_accounts
+                    .entry(id)
+                    .or_insert(MemoryAccountBuilder::try_new(id)?);
+                builder.push(Event::new(id, timestamp, event));
+                if is_exit {
+                    self.active_memory_accounts.remove(&id);
+                } else {
+                    self.active_memory_accounts.insert(id);
+                }
+                Ok(())
+            }
             DuckDBEvent::ExecutionThread(event) => self.push_execution_thread(id, timestamp, event),
             DuckDBEvent::TaskQueue(event) => self.push_task_queue(id, timestamp, event),
             DuckDBEvent::TemporaryIoChannel(event) => {
                 self.push_temporary_io_channel(id, timestamp, event)
+            }
+            DuckDBEvent::BufferPoolMemory(event) => {
+                self.push_buffer_pool_memory(id, timestamp, event)
+            }
+            DuckDBEvent::TemporaryStorage(event) => {
+                self.push_temporary_storage(id, timestamp, event)
+            }
+            DuckDBEvent::TemporaryDirectoryStorage(event) => {
+                self.push_temporary_directory_storage(id, timestamp, event)
             }
             DuckDBEvent::Engine(event) => {
                 self.push_query_engine(id, timestamp, QueryEngineEvent::Engine(event))
@@ -403,21 +453,25 @@ impl DuckDbModelBuilder {
                 builder.set_type_name(init.resource_type_name);
                 builder.set_instance_name(Some(init.instance_name));
                 builder.set_parent_group_id(init.parent_group_id);
+                self.initializing_runtime_resources.insert(id);
             }
             ExecutionThreadTransition::ExecutionThreadOperating(_) => {
                 builder.push(RtResourceTransition::Operating(
                     timestamp,
                     ResourceCapacities(vec![]),
                 ));
+                self.initializing_runtime_resources.remove(&id);
                 self.active_runtime_resources.insert(id);
                 self.finalizing_runtime_resources.remove(&id);
             }
             ExecutionThreadTransition::ExecutionThreadFinalizing(_) => {
                 builder.push(RtResourceTransition::Finalizing(timestamp));
+                self.initializing_runtime_resources.remove(&id);
                 self.finalizing_runtime_resources.insert(id);
             }
             ExecutionThreadTransition::Exit => {
                 builder.push(RtResourceTransition::Exit(timestamp));
+                self.initializing_runtime_resources.remove(&id);
                 self.active_runtime_resources.remove(&id);
                 self.finalizing_runtime_resources.remove(&id);
             }
@@ -441,6 +495,7 @@ impl DuckDbModelBuilder {
                 builder.set_type_name(init.resource_type_name);
                 builder.set_instance_name(Some(init.instance_name));
                 builder.set_parent_group_id(init.parent_group_id);
+                self.initializing_runtime_resources.insert(id);
             }
             TaskQueueTransition::TaskQueueOperating(operating) => {
                 builder.push(RtResourceTransition::Operating(
@@ -450,15 +505,18 @@ impl DuckDbModelBuilder {
                         operating.capacity_entries.value.unwrap_or(0),
                     )]),
                 ));
+                self.initializing_runtime_resources.remove(&id);
                 self.active_runtime_resources.insert(id);
                 self.finalizing_runtime_resources.remove(&id);
             }
             TaskQueueTransition::TaskQueueFinalizing(_) => {
                 builder.push(RtResourceTransition::Finalizing(timestamp));
+                self.initializing_runtime_resources.remove(&id);
                 self.finalizing_runtime_resources.insert(id);
             }
             TaskQueueTransition::Exit => {
                 builder.push(RtResourceTransition::Exit(timestamp));
+                self.initializing_runtime_resources.remove(&id);
                 self.active_runtime_resources.remove(&id);
                 self.finalizing_runtime_resources.remove(&id);
             }
@@ -486,6 +544,7 @@ impl DuckDbModelBuilder {
                 builder.set_type_name(init.resource_type_name);
                 builder.set_instance_name(Some(init.instance_name));
                 builder.set_parent_group_id(init.parent_group_id);
+                self.initializing_runtime_resources.insert(id);
             }
             TemporaryIoChannelTransition::TemporaryIoChannelOperating(operating) => {
                 builder.push(RtResourceTransition::Operating(
@@ -501,15 +560,145 @@ impl DuckDbModelBuilder {
                         ),
                     ]),
                 ));
+                self.initializing_runtime_resources.remove(&id);
                 self.active_runtime_resources.insert(id);
                 self.finalizing_runtime_resources.remove(&id);
             }
             TemporaryIoChannelTransition::TemporaryIoChannelFinalizing(_) => {
                 builder.push(RtResourceTransition::Finalizing(timestamp));
+                self.initializing_runtime_resources.remove(&id);
                 self.finalizing_runtime_resources.insert(id);
             }
             TemporaryIoChannelTransition::Exit => {
                 builder.push(RtResourceTransition::Exit(timestamp));
+                self.initializing_runtime_resources.remove(&id);
+                self.active_runtime_resources.remove(&id);
+                self.finalizing_runtime_resources.remove(&id);
+            }
+        }
+        Ok(())
+    }
+
+    fn push_buffer_pool_memory(
+        &mut self,
+        id: Uuid,
+        timestamp: u64,
+        event: memory_account::BufferPoolMemoryEvent,
+    ) -> AnalyzerResult<()> {
+        use memory_account::BufferPoolMemoryTransition as Transition;
+
+        let event = match event.state {
+            Transition::BufferPoolMemoryInitializing(state) => MemoryResourceEvent::Initializing {
+                instance_name: state.instance_name,
+                parent_group_id: state.parent_group_id,
+                resource_type_name: state.resource_type_name,
+            },
+            Transition::BufferPoolMemoryOperating(state) => {
+                MemoryResourceEvent::Operating(state.capacity_bytes.value)
+            }
+            Transition::BufferPoolMemoryResizing(_) => MemoryResourceEvent::Resizing,
+            Transition::BufferPoolMemoryFinalizing(_) => MemoryResourceEvent::Finalizing,
+            Transition::Exit => MemoryResourceEvent::Exit,
+        };
+        self.push_memory_resource(id, timestamp, event, BUFFER_POOL_MEMORY_TYPE_NAME)
+    }
+
+    fn push_temporary_storage(
+        &mut self,
+        id: Uuid,
+        timestamp: u64,
+        event: memory_account::TemporaryStorageEvent,
+    ) -> AnalyzerResult<()> {
+        use memory_account::TemporaryStorageTransition as Transition;
+
+        let event = match event.state {
+            Transition::TemporaryStorageInitializing(state) => MemoryResourceEvent::Initializing {
+                instance_name: state.instance_name,
+                parent_group_id: state.parent_group_id,
+                resource_type_name: state.resource_type_name,
+            },
+            Transition::TemporaryStorageOperating(state) => {
+                MemoryResourceEvent::Operating(state.capacity_bytes.value)
+            }
+            Transition::TemporaryStorageResizing(_) => MemoryResourceEvent::Resizing,
+            Transition::TemporaryStorageFinalizing(_) => MemoryResourceEvent::Finalizing,
+            Transition::Exit => MemoryResourceEvent::Exit,
+        };
+        self.push_memory_resource(id, timestamp, event, TEMPORARY_STORAGE_TYPE_NAME)
+    }
+
+    fn push_temporary_directory_storage(
+        &mut self,
+        id: Uuid,
+        timestamp: u64,
+        event: memory_account::TemporaryDirectoryStorageEvent,
+    ) -> AnalyzerResult<()> {
+        use memory_account::TemporaryDirectoryStorageTransition as Transition;
+
+        let event = match event.state {
+            Transition::TemporaryDirectoryStorageInitializing(state) => {
+                MemoryResourceEvent::Initializing {
+                    instance_name: state.instance_name,
+                    parent_group_id: state.parent_group_id,
+                    resource_type_name: state.resource_type_name,
+                }
+            }
+            Transition::TemporaryDirectoryStorageOperating(state) => {
+                MemoryResourceEvent::Operating(state.capacity_bytes.value)
+            }
+            Transition::TemporaryDirectoryStorageResizing(_) => MemoryResourceEvent::Resizing,
+            Transition::TemporaryDirectoryStorageFinalizing(_) => MemoryResourceEvent::Finalizing,
+            Transition::Exit => MemoryResourceEvent::Exit,
+        };
+        self.push_memory_resource(id, timestamp, event, TEMPORARY_DIRECTORY_STORAGE_TYPE_NAME)
+    }
+
+    fn push_memory_resource(
+        &mut self,
+        id: Uuid,
+        timestamp: u64,
+        event: MemoryResourceEvent,
+        expected_type: &'static str,
+    ) -> AnalyzerResult<()> {
+        let builder = self.runtime_resources.try_builder(id)?;
+        match event {
+            MemoryResourceEvent::Initializing {
+                instance_name,
+                parent_group_id,
+                resource_type_name,
+            } => {
+                validate_resource_type(&resource_type_name, expected_type, id)?;
+                builder.push(RtResourceTransition::Init(timestamp));
+                builder.set_type_name(resource_type_name);
+                builder.set_instance_name(Some(instance_name));
+                builder.set_parent_group_id(parent_group_id);
+                self.initializing_runtime_resources.insert(id);
+            }
+            MemoryResourceEvent::Operating(bytes) => {
+                let capacity = bytes.map_or_else(
+                    || CapacityValue::new_null(MEMORY_BYTES_CAPACITY_NAME),
+                    |bytes| CapacityValue::new(MEMORY_BYTES_CAPACITY_NAME, bytes),
+                );
+                builder.push(RtResourceTransition::Operating(
+                    timestamp,
+                    ResourceCapacities(vec![capacity]),
+                ));
+                self.initializing_runtime_resources.remove(&id);
+                self.active_runtime_resources.insert(id);
+                self.finalizing_runtime_resources.remove(&id);
+            }
+            MemoryResourceEvent::Resizing => {
+                builder.push(RtResourceTransition::Resizing(timestamp));
+                self.initializing_runtime_resources.remove(&id);
+            }
+            MemoryResourceEvent::Finalizing => {
+                builder.push(RtResourceTransition::Finalizing(timestamp));
+                self.initializing_runtime_resources.remove(&id);
+                self.finalizing_runtime_resources.insert(id);
+            }
+            MemoryResourceEvent::Exit => {
+                builder.push(RtResourceTransition::Exit(timestamp));
+                self.initializing_runtime_resources.remove(&id);
                 self.active_runtime_resources.remove(&id);
                 self.finalizing_runtime_resources.remove(&id);
             }
@@ -536,9 +725,38 @@ impl DuckDbModelBuilder {
             ))?;
         }
 
+        for id in self.active_memory_accounts.drain() {
+            let builder = self
+                .memory_accounts
+                .get_mut(&id)
+                .ok_or(AnalyzerError::InvalidId(id))?;
+            builder.push(Event::new(
+                id,
+                self.latest_event_timestamp,
+                FsmEvent {
+                    seq: 0,
+                    state: memory_account::MemoryAccountTransition::Exit,
+                },
+            ));
+        }
+
+        // Preserve an initializing resource with unknown capacity when a live
+        // snapshot lands between its Init and Operating events.
+        for id in self.initializing_runtime_resources.drain() {
+            let builder = self.runtime_resources.try_builder(id)?;
+            builder.push(RtResourceTransition::Operating(
+                self.latest_event_timestamp,
+                ResourceCapacities(vec![]),
+            ));
+            builder.push(RtResourceTransition::Finalizing(
+                self.latest_event_timestamp,
+            ));
+            builder.push(RtResourceTransition::Exit(self.latest_event_timestamp));
+        }
+
         // Runtime resources are engine-lived, while the analyzer may snapshot a
-        // completed query before the DuckDB instance exits. Close only resources
-        // that reached Operating; this is analysis-local and does not emit events.
+        // completed query before the DuckDB instance exits. Close resources that
+        // reached Operating; this is analysis-local and does not emit events.
         for id in self.active_runtime_resources.drain() {
             let builder = self.runtime_resources.try_builder(id)?;
             if !self.finalizing_runtime_resources.contains(&id) {
@@ -570,6 +788,11 @@ impl DuckDbModelBuilder {
             .temporary_block_ios
             .into_iter()
             .map(|(id, builder)| builder.try_build().map(|io| (id, io)))
+            .collect::<AnalyzerResult<HashMap<_, _>>>()?;
+        let memory_accounts = self
+            .memory_accounts
+            .into_iter()
+            .map(|(id, builder)| builder.try_build().map(|account| (id, account)))
             .collect::<AnalyzerResult<HashMap<_, _>>>()?;
 
         let mut query_engine = self.query_engine.try_build()?;
@@ -604,6 +827,12 @@ impl DuckDbModelBuilder {
                 )
             })
             .collect::<Vec<_>>();
+        let valid_memory_accounts = memory_accounts
+            .values()
+            .filter(|account| {
+                account.is_complete() && account.is_valid(self.engine_id, &runtime_resources)
+            })
+            .collect::<Vec<_>>();
 
         for entity in pipeline_tasks
             .iter()
@@ -616,6 +845,11 @@ impl DuckDbModelBuilder {
             )
             .chain(
                 valid_temporary_ios
+                    .iter()
+                    .map(|entity| *entity as &dyn EntityUsing),
+            )
+            .chain(
+                valid_memory_accounts
                     .iter()
                     .map(|entity| *entity as &dyn EntityUsing),
             )
@@ -639,6 +873,7 @@ impl DuckDbModelBuilder {
             chunk_transfers,
             operator_invocations,
             temporary_block_ios,
+            memory_accounts,
             resource_group_types: HashMap::new(),
         };
         let mut resource_group_types = derive_resource_group_types(&model)?;
@@ -656,6 +891,18 @@ impl DuckDbModelBuilder {
             ..model
         })
     }
+}
+
+enum MemoryResourceEvent {
+    Initializing {
+        instance_name: String,
+        parent_group_id: Uuid,
+        resource_type_name: String,
+    },
+    Operating(Option<u64>),
+    Resizing,
+    Finalizing,
+    Exit,
 }
 
 struct IntegrityTopology {
@@ -790,6 +1037,12 @@ impl EntityUsing for OperatorInvocation {
 }
 
 impl EntityUsing for TemporaryBlockIo {
+    fn populate_used_by(&self, resources: &mut InMemoryResources) -> AnalyzerResult<()> {
+        populate_used_by(self, self.usages(), resources)
+    }
+}
+
+impl EntityUsing for MemoryAccount {
     fn populate_used_by(&self, resources: &mut InMemoryResources) -> AnalyzerResult<()> {
         populate_used_by(self, self.usages(), resources)
     }

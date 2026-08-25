@@ -1,6 +1,7 @@
 use quent_model::{instrumentation, model};
 
 pub mod chunk_transfer;
+pub mod memory_account;
 pub mod operator_invocation;
 pub mod pipeline_task;
 pub mod runtime_resource;
@@ -20,6 +21,10 @@ model! {
         chunk_transfer::ChunkTransfer,
         operator_invocation::OperatorInvocation,
         temporary_block_io::TemporaryBlockIo,
+        memory_account::MemoryAccount,
+        memory_account::BufferPoolMemory,
+        memory_account::TemporaryStorage,
+        memory_account::TemporaryDirectoryStorage,
         runtime_resource::ExecutionThread,
         runtime_resource::TaskQueue,
         runtime_resource::TemporaryIoChannel,
