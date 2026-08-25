@@ -20,6 +20,7 @@
 
 namespace duckdb {
 class Executor;
+enum class TelemetryOperatorPhase : uint8_t;
 
 //! The result of executing a PipelineExecutor
 enum class PipelineExecuteResult {
@@ -177,7 +178,8 @@ private:
 	bool external_batch_initialized = false;
 
 private:
-	void StartOperator(PhysicalOperator &op);
+	void StartOperator(PhysicalOperator &op, TelemetryOperatorPhase phase,
+	                   optional_ptr<const DataChunk> input = nullptr);
 	void EndOperator(PhysicalOperator &op, optional_ptr<DataChunk> chunk);
 
 	//! Reset the operator index to the first operator

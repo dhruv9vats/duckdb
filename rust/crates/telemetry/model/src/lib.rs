@@ -1,5 +1,10 @@
 use quent_model::{instrumentation, model};
 
+pub mod chunk_transfer;
+pub mod operator_invocation;
+pub mod pipeline_task;
+pub mod runtime_resource;
+
 model! {
     name: DuckDB,
     root: quent_query_engine_model::engine::Engine,
@@ -10,6 +15,11 @@ model! {
         quent_query_engine_model::plan::Plan,
         quent_query_engine_model::operator::Operator,
         quent_query_engine_model::port::Port,
+        pipeline_task::PipelineTask,
+        chunk_transfer::ChunkTransfer,
+        operator_invocation::OperatorInvocation,
+        runtime_resource::ExecutionThread,
+        runtime_resource::TaskQueue,
     },
     analyzer: "duckdb-telemetry-analyzer",
 }

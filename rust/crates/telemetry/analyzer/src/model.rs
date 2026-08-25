@@ -1,0 +1,658 @@
+use std::collections::{HashMap, HashSet};
+
+use duckdb_telemetry_model::{DuckDBEvent, runtime_resource};
+use quent_analyzer::{
+    AnalyzerError, AnalyzerResult, Entity, Model,
+    resource::{
+        CapacityDecl, CapacityValue, Resource, ResourceCapacities, ResourceGroup,
+        ResourceGroupTypeDecl, ResourceTypeDecl, Usage, Using,
+        collection::{
+            InMemoryResources, InMemoryResourcesBuilder, ResourceCollection,
+            derive_resource_group_types,
+        },
+        runtime::RtResourceTransition,
+    },
+};
+use quent_events::Event;
+use quent_query_engine_analyzer::{
+    OperatorEntity, OperatorEntityMut, PlanEntity, QueryEngineModel,
+    plain::legacy::{
+        Engine, InMemoryQueryEngineModel, InMemoryQueryEngineModelBuilder, Operator, Plan, Port,
+        Query, QueryEngineEntityId, QueryGroup, Worker,
+    },
+    plan_tree::PlanTree,
+};
+use quent_query_engine_model::{QueryEngineEvent, engine, worker};
+use quent_simulator_ui::EntityRef;
+use uuid::Uuid;
+
+use crate::{
+    chunk_transfer::{ChunkTransfer, ChunkTransferBuilder},
+    operator_invocation::{OperatorInvocation, OperatorInvocationBuilder, OperatorInvocationExt},
+    pipeline_task::{PipelineTask, PipelineTaskBuilder, PipelineTaskExt},
+};
+
+pub(crate) const EXECUTION_THREAD_TYPE_NAME: &str = "execution_thread";
+pub(crate) const TASK_QUEUE_TYPE_NAME: &str = "task_queue";
+pub(crate) const QUEUE_ENTRIES_CAPACITY_NAME: &str = "capacity_entries";
+
+fn validate_resource_type(actual: &str, expected: &str, id: Uuid) -> AnalyzerResult<()> {
+    if actual == expected {
+        return Ok(());
+    }
+
+    Err(AnalyzerError::InvalidArgument(format!(
+        "resource {id} declared type {actual:?}, expected {expected:?}"
+    )))
+}
+
+fn insert_resource_types(resources: &mut InMemoryResources) {
+    resources.resource_types.insert(
+        EXECUTION_THREAD_TYPE_NAME.to_owned(),
+        ResourceTypeDecl::unit(EXECUTION_THREAD_TYPE_NAME),
+    );
+    resources.resource_types.insert(
+        TASK_QUEUE_TYPE_NAME.to_owned(),
+        ResourceTypeDecl::new(
+            TASK_QUEUE_TYPE_NAME,
+            [CapacityDecl::new_occupancy(QUEUE_ENTRIES_CAPACITY_NAME)],
+        ),
+    );
+}
+
+pub struct DuckDbModel {
+    pub(crate) query_engine: InMemoryQueryEngineModel,
+    pub(crate) runtime_resources: InMemoryResources,
+    pub(crate) pipeline_tasks: HashMap<Uuid, PipelineTask>,
+    pub(crate) chunk_transfers: HashMap<Uuid, ChunkTransfer>,
+    pub(crate) operator_invocations: HashMap<Uuid, OperatorInvocation>,
+    pub(crate) resource_group_types: HashMap<String, ResourceGroupTypeDecl>,
+}
+
+impl Model for DuckDbModel {
+    type EntityIdType = EntityRef;
+
+    fn try_entity_ref(&self, entity_id: Uuid) -> AnalyzerResult<EntityRef> {
+        if let Ok(entity) = self.query_engine.try_entity_ref(entity_id) {
+            return Ok(match entity {
+                QueryEngineEntityId::Engine(id) => EntityRef::Engine(id),
+                QueryEngineEntityId::Worker(id) => EntityRef::Worker(id),
+                QueryEngineEntityId::QueryGroup(id) => EntityRef::QueryGroup(id),
+                QueryEngineEntityId::Query(id) => EntityRef::Query(id),
+                QueryEngineEntityId::Plan(id) => EntityRef::Plan(id),
+                QueryEngineEntityId::Operator(id) => EntityRef::Operator(id),
+                QueryEngineEntityId::Port(id) => EntityRef::Port(id),
+            });
+        }
+
+        if self.runtime_resources.resources.contains_key(&entity_id) {
+            return Ok(EntityRef::Resource(entity_id));
+        }
+        if self
+            .runtime_resources
+            .resource_groups
+            .contains_key(&entity_id)
+        {
+            return Ok(EntityRef::ResourceGroup(entity_id));
+        }
+
+        (self.pipeline_tasks.contains_key(&entity_id)
+            || self.operator_invocations.contains_key(&entity_id))
+        .then_some(EntityRef::Task(entity_id))
+        .ok_or(AnalyzerError::InvalidId(entity_id))
+    }
+
+    fn root(&self) -> AnalyzerResult<&impl ResourceGroup> {
+        self.query_engine.root()
+    }
+}
+
+impl ResourceCollection for DuckDbModel {
+    fn resources(&self) -> impl Iterator<Item = &dyn Resource> {
+        self.runtime_resources
+            .resources()
+            .chain(self.query_engine.resources())
+    }
+
+    fn resource_groups(&self) -> impl Iterator<Item = &dyn ResourceGroup> {
+        self.runtime_resources
+            .resource_groups()
+            .chain(self.query_engine.resource_groups())
+    }
+
+    fn resource(&self, resource_id: Uuid) -> AnalyzerResult<&dyn Resource> {
+        self.runtime_resources
+            .resource(resource_id)
+            .or_else(|_| self.query_engine.resource(resource_id))
+    }
+
+    fn resource_type(&self, resource_type_name: &str) -> AnalyzerResult<&ResourceTypeDecl> {
+        self.runtime_resources
+            .resource_type(resource_type_name)
+            .or_else(|_| self.query_engine.resource_type(resource_type_name))
+    }
+
+    fn resource_group(&self, resource_group_id: Uuid) -> AnalyzerResult<&dyn ResourceGroup> {
+        self.query_engine
+            .resource_group(resource_group_id)
+            .or_else(|_| self.runtime_resources.resource_group(resource_group_id))
+    }
+
+    fn resource_group_child_groups(
+        &self,
+        resource_group_id: Uuid,
+    ) -> AnalyzerResult<impl Iterator<Item = Uuid>> {
+        self.resource_group(resource_group_id)?;
+
+        let query_engine = self
+            .query_engine
+            .resource_group_child_groups(resource_group_id)
+            .ok();
+        let runtime = self
+            .runtime_resources
+            .resource_groups
+            .values()
+            .filter_map(move |group| {
+                (group.parent_group_id == Some(resource_group_id)).then_some(group.id)
+            });
+        Ok(query_engine.into_iter().flatten().chain(runtime))
+    }
+
+    fn resource_group_child_resources(
+        &self,
+        resource_group_id: Uuid,
+    ) -> AnalyzerResult<impl Iterator<Item = Uuid>> {
+        self.resource_group(resource_group_id)?;
+
+        let query_engine = self
+            .query_engine
+            .resource_group_child_resources(resource_group_id)
+            .ok();
+        let runtime = self
+            .runtime_resources
+            .resources
+            .values()
+            .filter_map(move |resource| {
+                (resource.parent_group_id() == resource_group_id).then_some(resource.id)
+            });
+        Ok(query_engine.into_iter().flatten().chain(runtime))
+    }
+}
+
+impl QueryEngineModel for DuckDbModel {
+    type Engine = Engine;
+    type Query = Query;
+    type QueryGroup = QueryGroup;
+    type Worker = Worker;
+    type Plan = Plan;
+    type Operator = Operator;
+    type Port = Port;
+
+    fn engine(&self) -> AnalyzerResult<&Engine> {
+        self.query_engine.engine()
+    }
+
+    fn query(&self, query_id: Uuid) -> AnalyzerResult<&Query> {
+        self.query_engine.query(query_id)
+    }
+
+    fn query_group(&self, query_group_id: Uuid) -> AnalyzerResult<&QueryGroup> {
+        self.query_engine.query_group(query_group_id)
+    }
+
+    fn worker(&self, worker_id: Uuid) -> AnalyzerResult<&Worker> {
+        self.query_engine.worker(worker_id)
+    }
+
+    fn plan(&self, plan_id: Uuid) -> AnalyzerResult<&Plan> {
+        self.query_engine.plan(plan_id)
+    }
+
+    fn operator(&self, operator_id: Uuid) -> AnalyzerResult<&Operator> {
+        self.query_engine.operator(operator_id)
+    }
+
+    fn port(&self, port_id: Uuid) -> AnalyzerResult<&Port> {
+        self.query_engine.port(port_id)
+    }
+
+    fn queries(&self) -> impl Iterator<Item = &Query> {
+        self.query_engine.queries()
+    }
+
+    fn query_groups(&self) -> impl Iterator<Item = &QueryGroup> {
+        self.query_engine.query_groups()
+    }
+
+    fn workers(&self) -> impl Iterator<Item = &Worker> {
+        self.query_engine.workers()
+    }
+
+    fn plans(&self) -> impl Iterator<Item = &Plan> {
+        self.query_engine.plans()
+    }
+
+    fn operators(&self) -> impl Iterator<Item = &Operator> {
+        self.query_engine.operators()
+    }
+
+    fn ports(&self) -> impl Iterator<Item = &Port> {
+        self.query_engine.ports()
+    }
+
+    fn plan_tree(&self, query_id: Uuid) -> AnalyzerResult<PlanTree> {
+        self.query_engine.plan_tree(query_id)
+    }
+}
+
+pub(crate) struct DuckDbModelBuilder {
+    engine_id: Uuid,
+    query_engine: InMemoryQueryEngineModelBuilder,
+    runtime_resources: InMemoryResourcesBuilder,
+    pipeline_tasks: HashMap<Uuid, PipelineTaskBuilder>,
+    chunk_transfers: HashMap<Uuid, ChunkTransferBuilder>,
+    operator_invocations: HashMap<Uuid, OperatorInvocationBuilder>,
+    active_runtime_resources: HashSet<Uuid>,
+    finalizing_runtime_resources: HashSet<Uuid>,
+    engine_active: bool,
+    active_workers: HashSet<Uuid>,
+    latest_event_timestamp: u64,
+}
+
+impl DuckDbModelBuilder {
+    pub(crate) fn try_new(engine_id: Uuid) -> AnalyzerResult<Self> {
+        Ok(Self {
+            engine_id,
+            query_engine: InMemoryQueryEngineModelBuilder::try_new(engine_id)?,
+            runtime_resources: InMemoryResourcesBuilder::default(),
+            pipeline_tasks: HashMap::new(),
+            chunk_transfers: HashMap::new(),
+            operator_invocations: HashMap::new(),
+            active_runtime_resources: HashSet::new(),
+            finalizing_runtime_resources: HashSet::new(),
+            engine_active: false,
+            active_workers: HashSet::new(),
+            latest_event_timestamp: 0,
+        })
+    }
+
+    pub(crate) fn try_push(&mut self, event: Event<DuckDBEvent>) -> AnalyzerResult<()> {
+        let Event {
+            id,
+            timestamp,
+            data,
+        } = event;
+        self.latest_event_timestamp = self.latest_event_timestamp.max(timestamp);
+        match data {
+            DuckDBEvent::PipelineTask(event) => {
+                let builder = self
+                    .pipeline_tasks
+                    .entry(id)
+                    .or_insert(PipelineTaskBuilder::try_new(id)?);
+                builder.push(Event::new(id, timestamp, event));
+                Ok(())
+            }
+            DuckDBEvent::ChunkTransfer(event) => {
+                let builder = self
+                    .chunk_transfers
+                    .entry(id)
+                    .or_insert(ChunkTransferBuilder::try_new(id)?);
+                builder.push(Event::new(id, timestamp, event));
+                Ok(())
+            }
+            DuckDBEvent::OperatorInvocation(event) => {
+                let builder = self
+                    .operator_invocations
+                    .entry(id)
+                    .or_insert(OperatorInvocationBuilder::try_new(id)?);
+                builder.push(Event::new(id, timestamp, event));
+                Ok(())
+            }
+            DuckDBEvent::ExecutionThread(event) => self.push_execution_thread(id, timestamp, event),
+            DuckDBEvent::TaskQueue(event) => self.push_task_queue(id, timestamp, event),
+            DuckDBEvent::Engine(event) => {
+                self.push_query_engine(id, timestamp, QueryEngineEvent::Engine(event))
+            }
+            DuckDBEvent::Worker(event) => {
+                self.push_query_engine(id, timestamp, QueryEngineEvent::Worker(event))
+            }
+            DuckDBEvent::QueryGroup(event) => {
+                self.push_query_engine(id, timestamp, QueryEngineEvent::QueryGroup(event))
+            }
+            DuckDBEvent::Query(event) => {
+                self.push_query_engine(id, timestamp, QueryEngineEvent::Query(event))
+            }
+            DuckDBEvent::Plan(event) => {
+                self.push_query_engine(id, timestamp, QueryEngineEvent::Plan(event))
+            }
+            DuckDBEvent::Operator(event) => {
+                self.push_query_engine(id, timestamp, QueryEngineEvent::Operator(event))
+            }
+            DuckDBEvent::Port(event) => {
+                self.push_query_engine(id, timestamp, QueryEngineEvent::Port(event))
+            }
+        }
+    }
+
+    fn push_query_engine(
+        &mut self,
+        id: Uuid,
+        timestamp: u64,
+        event: QueryEngineEvent,
+    ) -> AnalyzerResult<()> {
+        match &event {
+            QueryEngineEvent::Engine(engine::EngineEvent::Init(_)) => {
+                self.engine_active = true;
+            }
+            QueryEngineEvent::Engine(engine::EngineEvent::Exit(_)) => {
+                self.engine_active = false;
+            }
+            QueryEngineEvent::Worker(worker::WorkerEvent::Init(_)) => {
+                self.active_workers.insert(id);
+            }
+            QueryEngineEvent::Worker(worker::WorkerEvent::Exit(_)) => {
+                self.active_workers.remove(&id);
+            }
+            _ => {}
+        }
+        self.query_engine.try_push(Event::new(id, timestamp, event))
+    }
+
+    fn push_execution_thread(
+        &mut self,
+        id: Uuid,
+        timestamp: u64,
+        event: runtime_resource::ExecutionThreadEvent,
+    ) -> AnalyzerResult<()> {
+        use runtime_resource::ExecutionThreadTransition;
+
+        let builder = self.runtime_resources.try_builder(id)?;
+        match event.state {
+            ExecutionThreadTransition::ExecutionThreadInitializing(init) => {
+                validate_resource_type(&init.resource_type_name, EXECUTION_THREAD_TYPE_NAME, id)?;
+                builder.push(RtResourceTransition::Init(timestamp));
+                builder.set_type_name(init.resource_type_name);
+                builder.set_instance_name(Some(init.instance_name));
+                builder.set_parent_group_id(init.parent_group_id);
+            }
+            ExecutionThreadTransition::ExecutionThreadOperating(_) => {
+                builder.push(RtResourceTransition::Operating(
+                    timestamp,
+                    ResourceCapacities(vec![]),
+                ));
+                self.active_runtime_resources.insert(id);
+                self.finalizing_runtime_resources.remove(&id);
+            }
+            ExecutionThreadTransition::ExecutionThreadFinalizing(_) => {
+                builder.push(RtResourceTransition::Finalizing(timestamp));
+                self.finalizing_runtime_resources.insert(id);
+            }
+            ExecutionThreadTransition::Exit => {
+                builder.push(RtResourceTransition::Exit(timestamp));
+                self.active_runtime_resources.remove(&id);
+                self.finalizing_runtime_resources.remove(&id);
+            }
+        }
+        Ok(())
+    }
+
+    fn push_task_queue(
+        &mut self,
+        id: Uuid,
+        timestamp: u64,
+        event: runtime_resource::TaskQueueEvent,
+    ) -> AnalyzerResult<()> {
+        use runtime_resource::TaskQueueTransition;
+
+        let builder = self.runtime_resources.try_builder(id)?;
+        match event.state {
+            TaskQueueTransition::TaskQueueInitializing(init) => {
+                validate_resource_type(&init.resource_type_name, TASK_QUEUE_TYPE_NAME, id)?;
+                builder.push(RtResourceTransition::Init(timestamp));
+                builder.set_type_name(init.resource_type_name);
+                builder.set_instance_name(Some(init.instance_name));
+                builder.set_parent_group_id(init.parent_group_id);
+            }
+            TaskQueueTransition::TaskQueueOperating(operating) => {
+                builder.push(RtResourceTransition::Operating(
+                    timestamp,
+                    ResourceCapacities(vec![CapacityValue::new(
+                        QUEUE_ENTRIES_CAPACITY_NAME,
+                        operating.capacity_entries.value.unwrap_or(0),
+                    )]),
+                ));
+                self.active_runtime_resources.insert(id);
+                self.finalizing_runtime_resources.remove(&id);
+            }
+            TaskQueueTransition::TaskQueueFinalizing(_) => {
+                builder.push(RtResourceTransition::Finalizing(timestamp));
+                self.finalizing_runtime_resources.insert(id);
+            }
+            TaskQueueTransition::Exit => {
+                builder.push(RtResourceTransition::Exit(timestamp));
+                self.active_runtime_resources.remove(&id);
+                self.finalizing_runtime_resources.remove(&id);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn try_build(mut self) -> AnalyzerResult<DuckDbModel> {
+        // Engine and worker lifetimes outlive completed queries in collector
+        // captures. Close them only in this immutable analyzer snapshot so
+        // the server's timeline cache has a finite engine span.
+        for worker_id in self.active_workers.drain() {
+            self.query_engine.try_push(Event::new(
+                worker_id,
+                self.latest_event_timestamp,
+                QueryEngineEvent::Worker(worker::WorkerEvent::Exit(worker::Exit)),
+            ))?;
+        }
+        if self.engine_active {
+            self.query_engine.try_push(Event::new(
+                self.engine_id,
+                self.latest_event_timestamp,
+                QueryEngineEvent::Engine(engine::EngineEvent::Exit(engine::Exit)),
+            ))?;
+        }
+
+        // Runtime resources are engine-lived, while the analyzer may snapshot a
+        // completed query before the DuckDB instance exits. Close only resources
+        // that reached Operating; this is analysis-local and does not emit events.
+        for id in self.active_runtime_resources.drain() {
+            let builder = self.runtime_resources.try_builder(id)?;
+            if !self.finalizing_runtime_resources.contains(&id) {
+                builder.push(RtResourceTransition::Finalizing(
+                    self.latest_event_timestamp,
+                ));
+            }
+            builder.push(RtResourceTransition::Exit(self.latest_event_timestamp));
+        }
+        let mut runtime_resources = self.runtime_resources.try_build()?;
+        insert_resource_types(&mut runtime_resources);
+
+        let pipeline_tasks = self
+            .pipeline_tasks
+            .into_iter()
+            .map(|(id, builder)| builder.try_build().map(|task| (id, task)))
+            .collect::<AnalyzerResult<HashMap<_, _>>>()?;
+        let chunk_transfers = self
+            .chunk_transfers
+            .into_iter()
+            .map(|(id, builder)| builder.try_build().map(|transfer| (id, transfer)))
+            .collect::<AnalyzerResult<HashMap<_, _>>>()?;
+        let operator_invocations = self
+            .operator_invocations
+            .into_iter()
+            .map(|(id, builder)| builder.try_build().map(|invocation| (id, invocation)))
+            .collect::<AnalyzerResult<HashMap<_, _>>>()?;
+
+        let mut query_engine = self.query_engine.try_build()?;
+        let valid_tasks: HashMap<Uuid, HashSet<Uuid>> = pipeline_tasks
+            .iter()
+            .filter(|(_, task)| task_is_valid(task, &query_engine, &runtime_resources))
+            .filter_map(|(id, task)| {
+                task.operator_ids()
+                    .map(|operator_ids| (*id, operator_ids.iter().copied().collect()))
+            })
+            .collect();
+        let valid_invocations: Vec<&OperatorInvocation> = operator_invocations
+            .values()
+            .filter(|invocation| {
+                invocation_is_valid(invocation, &valid_tasks, &query_engine, &runtime_resources)
+            })
+            .collect();
+
+        for entity in pipeline_tasks
+            .iter()
+            .filter(|(id, _)| valid_tasks.contains_key(id))
+            .map(|(_, entity)| entity as &dyn EntityUsing)
+            .chain(
+                valid_invocations
+                    .iter()
+                    .map(|entity| *entity as &dyn EntityUsing),
+            )
+        {
+            entity.populate_used_by(&mut runtime_resources)?;
+        }
+
+        for invocation in valid_invocations {
+            if let (Some(operator_id), Some(span)) =
+                (invocation.operator_id(), invocation.active_span())
+                && let Some(operator) = query_engine.operators.get_mut(&operator_id)
+            {
+                operator.extend_active_span(span);
+            }
+        }
+
+        let model = DuckDbModel {
+            query_engine,
+            runtime_resources,
+            pipeline_tasks,
+            chunk_transfers,
+            operator_invocations,
+            resource_group_types: HashMap::new(),
+        };
+        let mut resource_group_types = derive_resource_group_types(&model)?;
+        for group_type in resource_group_types.values_mut() {
+            for resource_type_name in &group_type.contains_resource_types {
+                let resource_type = model.runtime_resources.resource_type(resource_type_name)?;
+                group_type
+                    .used_by_entity_types
+                    .extend(resource_type.used_by.iter().cloned());
+            }
+        }
+
+        Ok(DuckDbModel {
+            resource_group_types: resource_group_types.into_iter().collect(),
+            ..model
+        })
+    }
+}
+
+struct IntegrityTopology {
+    plan_ids: HashSet<Uuid>,
+    plan_workers: HashMap<Uuid, Uuid>,
+    operator_plans: HashMap<Uuid, Uuid>,
+}
+
+fn integrity_topology(
+    query_engine: &InMemoryQueryEngineModel,
+    query_id: Uuid,
+) -> Option<IntegrityTopology> {
+    let view = query_engine.query_view(query_id).ok()?;
+    let worker_ids: HashSet<Uuid> = view.workers().map(|worker| worker.id()).collect();
+    Some(IntegrityTopology {
+        plan_ids: view.plans().map(|plan| plan.id()).collect(),
+        plan_workers: view
+            .plans()
+            .filter_map(|plan| {
+                plan.worker_id()
+                    .filter(|worker_id| worker_ids.contains(worker_id))
+                    .map(|worker_id| (plan.id(), worker_id))
+            })
+            .collect(),
+        operator_plans: view
+            .operators()
+            .filter_map(|operator| operator.plan_id().map(|plan_id| (operator.id(), plan_id)))
+            .collect(),
+    })
+}
+
+fn task_is_valid(
+    task: &PipelineTask,
+    query_engine: &InMemoryQueryEngineModel,
+    resources: &InMemoryResources,
+) -> bool {
+    let Some(topology) = task
+        .query_id()
+        .and_then(|query_id| integrity_topology(query_engine, query_id))
+    else {
+        return false;
+    };
+    task.is_complete()
+        && task.belongs_to_query(
+            &topology.operator_plans,
+            &topology.plan_workers,
+            &topology.plan_ids,
+        )
+        && task.resources_are_valid(resources)
+}
+
+fn invocation_is_valid(
+    invocation: &OperatorInvocation,
+    valid_tasks: &HashMap<Uuid, HashSet<Uuid>>,
+    query_engine: &InMemoryQueryEngineModel,
+    resources: &InMemoryResources,
+) -> bool {
+    let Some(topology) = invocation
+        .query_id()
+        .and_then(|query_id| integrity_topology(query_engine, query_id))
+    else {
+        return false;
+    };
+    invocation.is_complete()
+        && invocation.belongs_to_query(
+            &topology.operator_plans,
+            &topology.plan_workers,
+            &topology.plan_ids,
+            valid_tasks,
+        )
+        && invocation.resources_are_valid(&topology.plan_workers, resources)
+}
+
+trait EntityUsing: Entity {
+    fn populate_used_by(&self, resources: &mut InMemoryResources) -> AnalyzerResult<()>;
+}
+
+fn populate_used_by<'a>(
+    entity: &impl Entity,
+    usages: impl Iterator<Item = impl Usage<'a>>,
+    resources: &mut InMemoryResources,
+) -> AnalyzerResult<()> {
+    for usage in usages {
+        let resource_type_name = resources
+            .resource(usage.resource_id())?
+            .type_name()
+            .to_owned();
+        resources
+            .resource_types
+            .get_mut(&resource_type_name)
+            .ok_or_else(|| AnalyzerError::InvalidTypeName(resource_type_name.clone()))?
+            .used_by
+            .insert(entity.type_name().to_owned());
+    }
+    Ok(())
+}
+
+impl EntityUsing for PipelineTask {
+    fn populate_used_by(&self, resources: &mut InMemoryResources) -> AnalyzerResult<()> {
+        populate_used_by(self, self.usages(), resources)
+    }
+}
+
+impl EntityUsing for OperatorInvocation {
+    fn populate_used_by(&self, resources: &mut InMemoryResources) -> AnalyzerResult<()> {
+        populate_used_by(self, self.usages(), resources)
+    }
+}

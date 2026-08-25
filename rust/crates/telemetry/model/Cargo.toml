@@ -9,6 +9,7 @@ collector = ["quent-model/collector"]
 [dependencies]
 quent-model = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
 quent-query-engine-model = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+uuid = "1"
 
 [build-dependencies]
 # Records this repository as the model source in the generated model.qmi.
@@ -18,4 +19,3 @@ quent-build-info = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca
 clap = { version = "4", features = ["derive", "env"] }
 quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127", features = ["clap"] }
 uuid = { version = "1", features = ["macro-diagnostics"] }
-

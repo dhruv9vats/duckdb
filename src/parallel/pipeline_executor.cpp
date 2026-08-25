@@ -3,6 +3,7 @@
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/telemetry_context.hpp"
 
 #include "duckdb/main/settings.hpp"
 
@@ -189,10 +190,15 @@ bool PipelineExecutor::TryFlushCachingOperators(ExecutionBudget &chunk_budget) {
 
 		if (in_process_operators.empty()) {
 			curr_chunk.Reset();
-			StartOperator(current_operator);
+			StartOperator(current_operator, TelemetryOperatorPhase::FINAL_EXECUTE);
 			finalize_result = current_operator.FinalExecute(context, curr_chunk, *current_operator.op_state,
 			                                                *intermediate_states[flushing_idx]);
 			EndOperator(current_operator, &curr_chunk);
+			if (curr_chunk.size() > 0) {
+				auto &target = flushing_idx + 1 < pipeline.operators.size() ? pipeline.operators[flushing_idx + 1].get()
+				                                                            : *pipeline.sink;
+				TelemetryContext::EmitChunkTransfer(context.client, *this, current_operator, target, curr_chunk);
+			}
 		} else {
 			// Reset flag and reflush the last chunk we were flushing.
 			finalize_result = OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
@@ -385,6 +391,10 @@ PipelineExecuteResult PipelineExecutor::Execute(idx_t max_chunks) {
 				// "Regular" path: fetch a chunk from the source and push it through the pipeline
 				source_chunk.Reset();
 				source_result = FetchFromSource(source_chunk);
+				if (source_chunk.size() > 0) {
+					auto &target = pipeline.operators.empty() ? *pipeline.sink : pipeline.operators[0].get();
+					TelemetryContext::EmitChunkTransfer(context.client, *this, *pipeline.source, target, source_chunk);
+				}
 				if (source_result.batch_index_state == SourceBatchIndexState::ADVANCED) {
 					D_ASSERT(source_result.result == SourceResultType::BLOCKED);
 					D_ASSERT(required_partition_info.RequiresBatchIndex());
@@ -463,6 +473,8 @@ PipelineExecuteResult PipelineExecutor::PushExternal(DataChunk &input,
 	if (!remaining_sink_chunk && !next_batch_blocked) {
 		context.thread.profiler.StartOperator(pipeline.source.get());
 		context.thread.profiler.EndOperator(&input);
+		auto &target = pipeline.operators.empty() ? *pipeline.sink : pipeline.operators[0].get();
+		TelemetryContext::EmitChunkTransfer(context.client, *this, *pipeline.source, target, input);
 	}
 
 	ExecutionBudget chunk_budget(NumericLimits<idx_t>::Maximum());
@@ -595,7 +607,7 @@ OperatorResultType PipelineExecutor::ExecutePushInternal(DataChunk &input, Execu
 		}
 		auto &sink_chunk = final_chunk;
 		if (sink_chunk.size() > 0) {
-			StartOperator(*pipeline.sink);
+			StartOperator(*pipeline.sink, TelemetryOperatorPhase::SINK, sink_chunk);
 			D_ASSERT(pipeline.sink);
 			D_ASSERT(pipeline.sink->sink_state);
 			OperatorSinkInput sink_input {*pipeline.sink->sink_state, *local_sink_state, interrupt_state};
@@ -777,10 +789,15 @@ OperatorResultType PipelineExecutor::Execute(DataChunk &input, DataChunk &result
 
 			// if current_idx > source_idx, we pass the previous operators' output through the Execute of the current
 			// operator
-			StartOperator(current_operator);
+			StartOperator(current_operator, TelemetryOperatorPhase::EXECUTE, prev_chunk);
 			auto result = current_operator.Execute(context, prev_chunk, current_chunk, *current_operator.op_state,
 			                                       *intermediate_states[current_intermediate - 1]);
 			EndOperator(current_operator, &current_chunk);
+			if (current_chunk.size() > 0) {
+				auto &target = operator_idx + 1 < pipeline.operators.size() ? pipeline.operators[operator_idx + 1].get()
+				                                                            : *pipeline.sink;
+				TelemetryContext::EmitChunkTransfer(context.client, *this, current_operator, target, current_chunk);
+			}
 			if (result == OperatorResultType::HAVE_MORE_OUTPUT) {
 				// more data remains in this operator
 				// push in-process marker
@@ -860,7 +877,7 @@ PipelineExecutor::SourceFetchResult PipelineExecutor::FetchFromSource(DataChunk 
 	D_ASSERT(!pipeline.IsExternalInput());
 	D_ASSERT(global_source_state);
 	D_ASSERT(local_source_state);
-	StartOperator(*pipeline.source);
+	StartOperator(*pipeline.source, TelemetryOperatorPhase::SOURCE);
 
 	OperatorSourceInput source_input = {*global_source_state, *local_source_state, interrupt_state};
 	SourceFetchResult fetch_result;
@@ -886,17 +903,20 @@ void PipelineExecutor::InitializeChunk(DataChunk &chunk) {
 	chunk.Initialize(BufferAllocator::Get(context.client), last_op.GetTypes());
 }
 
-void PipelineExecutor::StartOperator(PhysicalOperator &op) {
+void PipelineExecutor::StartOperator(PhysicalOperator &op, TelemetryOperatorPhase phase,
+                                     optional_ptr<const DataChunk> input) {
 	context.client.InterruptCheck();
 	context.thread.profiler.StartOperator(&op);
+	TelemetryContext::OperatorInvocationStarted(context.client, *this, op, phase, input);
 }
 
 void PipelineExecutor::EndOperator(PhysicalOperator &op, optional_ptr<DataChunk> chunk) {
 	context.thread.profiler.EndOperator(chunk);
-
 	if (chunk) {
 		chunk->Verify(context.client.db);
 	}
+	optional_ptr<const DataChunk> output = chunk ? optional_ptr<const DataChunk>(*chunk) : nullptr;
+	TelemetryContext::OperatorInvocationFinished(context.client, *this, op, output);
 }
 
 } // namespace duckdb

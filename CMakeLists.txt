@@ -1105,6 +1105,7 @@ elseif (BUILD_MAIN_DUCKDB_LIBRARY)
     target_link_libraries(duckdb_static PRIVATE duckdb_telemetry_bridge)
     target_link_libraries(duckdb_main PRIVATE duckdb_telemetry_bridge)
     target_compile_definitions(duckdb_main PRIVATE DUCKDB_QUENT_TELEMETRY)
+    target_compile_definitions(duckdb_parallel PRIVATE DUCKDB_QUENT_TELEMETRY)
   endif()
 
   add_subdirectory(tools)
