@@ -796,9 +796,29 @@ impl DuckDbModelBuilder {
             .collect::<AnalyzerResult<HashMap<_, _>>>()?;
 
         let mut query_engine = self.query_engine.try_build()?;
+
+        // Integrity topology is identical for every entity sharing a query and is
+        // expensive to derive, so memoize it once per query. Without this, model
+        // construction is quadratic in the number of task/invocation/IO events.
+        let topologies: HashMap<Uuid, IntegrityTopology> = pipeline_tasks
+            .values()
+            .filter_map(|task| task.query_id())
+            .chain(
+                operator_invocations
+                    .values()
+                    .filter_map(|invocation| invocation.query_id()),
+            )
+            .chain(temporary_block_ios.values().filter_map(|io| io.query_id()))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter_map(|query_id| {
+                integrity_topology(&query_engine, query_id).map(|topology| (query_id, topology))
+            })
+            .collect();
+
         let valid_tasks: HashMap<Uuid, HashSet<Uuid>> = pipeline_tasks
             .iter()
-            .filter(|(_, task)| task_is_valid(task, &query_engine, &runtime_resources))
+            .filter(|(_, task)| task_is_valid(task, &topologies, &runtime_resources))
             .filter_map(|(id, task)| {
                 task.operator_ids()
                     .map(|operator_ids| (*id, operator_ids.iter().copied().collect()))
@@ -812,7 +832,7 @@ impl DuckDbModelBuilder {
         let valid_invocations: Vec<&OperatorInvocation> = operator_invocations
             .values()
             .filter(|invocation| {
-                invocation_is_valid(invocation, &valid_tasks, &query_engine, &runtime_resources)
+                invocation_is_valid(invocation, &valid_tasks, &topologies, &runtime_resources)
             })
             .collect();
         let valid_temporary_ios = temporary_block_ios
@@ -822,7 +842,7 @@ impl DuckDbModelBuilder {
                     io,
                     &valid_task_plans,
                     &valid_tasks,
-                    &query_engine,
+                    &topologies,
                     &runtime_resources,
                 )
             })
@@ -936,12 +956,12 @@ fn integrity_topology(
 
 fn task_is_valid(
     task: &PipelineTask,
-    query_engine: &InMemoryQueryEngineModel,
+    topologies: &HashMap<Uuid, IntegrityTopology>,
     resources: &InMemoryResources,
 ) -> bool {
     let Some(topology) = task
         .query_id()
-        .and_then(|query_id| integrity_topology(query_engine, query_id))
+        .and_then(|query_id| topologies.get(&query_id))
     else {
         return false;
     };
@@ -957,12 +977,12 @@ fn task_is_valid(
 fn invocation_is_valid(
     invocation: &OperatorInvocation,
     valid_tasks: &HashMap<Uuid, HashSet<Uuid>>,
-    query_engine: &InMemoryQueryEngineModel,
+    topologies: &HashMap<Uuid, IntegrityTopology>,
     resources: &InMemoryResources,
 ) -> bool {
     let Some(topology) = invocation
         .query_id()
-        .and_then(|query_id| integrity_topology(query_engine, query_id))
+        .and_then(|query_id| topologies.get(&query_id))
     else {
         return false;
     };
@@ -980,13 +1000,10 @@ fn temporary_io_is_valid(
     io: &TemporaryBlockIo,
     task_plans: &HashMap<Uuid, Uuid>,
     task_operators: &HashMap<Uuid, HashSet<Uuid>>,
-    query_engine: &InMemoryQueryEngineModel,
+    topologies: &HashMap<Uuid, IntegrityTopology>,
     resources: &InMemoryResources,
 ) -> bool {
-    let Some(topology) = io
-        .query_id()
-        .and_then(|query_id| integrity_topology(query_engine, query_id))
-    else {
+    let Some(topology) = io.query_id().and_then(|query_id| topologies.get(&query_id)) else {
         return false;
     };
     io.is_complete()

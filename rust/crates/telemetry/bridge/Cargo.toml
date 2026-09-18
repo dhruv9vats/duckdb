@@ -14,5 +14,5 @@ duckdb-telemetry-model = { path = "../model" }
 [build-dependencies]
 cxx-build.workspace = true
 duckdb-telemetry-model = { path = "../model" }
-quent-codegen = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+quent-codegen = { git = "https://github.com/rapidsai/quent.git", rev = "a872bf1a113c6509ccb4347fc98b067bd6c1829f" }
 

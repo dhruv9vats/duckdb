@@ -71,7 +71,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys",
 ]
 
 [[package]]
@@ -82,7 +82,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys",
 ]
 
 [[package]]
@@ -779,7 +779,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys",
 ]
 
 [[package]]
@@ -1372,7 +1372,7 @@ checksum = "30d65c71f1ce40ab09135ce117d742b9f8a19ff91a41a8b57ed50bc2de59c427"
 dependencies = [
  "libc",
  "wasi",
- "windows-sys 0.61.2",
+ "windows-sys",
 ]
 
 [[package]]
@@ -1413,7 +1413,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys",
 ]
 
 [[package]]
@@ -1443,6 +1443,48 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "nvtx-analyzer"
+version = "0.1.0"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
+dependencies = [
+ "nvtx-bridge",
+ "nvtx-events",
+ "quent-events",
+ "quent-time",
+ "rustc-hash",
+ "tracing",
+]
+
+[[package]]
+name = "nvtx-bridge"
+version = "0.1.0"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
+dependencies = [
+ "nvtx-events",
+ "quent-events",
+ "serde",
+]
+
+[[package]]
+name = "nvtx-events"
+version = "0.1.0"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "nvtx-ui"
+version = "0.1.0"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
+dependencies = [
+ "nvtx-analyzer",
+ "quent-time",
+ "serde",
+ "ts-rs",
 ]
 
 [[package]]
@@ -1618,6 +1660,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "prettyplease"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bfe0f4c752e450fc2faf62654f1c134747922825d5b04ca717b8874f41a40c0"
+dependencies = [
+ "proc-macro2",
+ "syn 3.0.3",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1647,7 +1699,7 @@ dependencies = [
  "log",
  "multimap",
  "petgraph",
- "prettyplease",
+ "prettyplease 0.2.37",
  "prost",
  "prost-types",
  "pulldown-cmark",
@@ -1712,7 +1764,7 @@ dependencies = [
 [[package]]
 name = "quent-analyzer"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "quent-dynamic-attributes",
  "quent-events",
@@ -1729,7 +1781,7 @@ dependencies = [
 [[package]]
 name = "quent-build-info"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "serde",
  "serde_json",
@@ -1738,20 +1790,20 @@ dependencies = [
 [[package]]
 name = "quent-codegen"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "convert_case",
- "prettyplease",
+ "prettyplease 0.3.0",
  "proc-macro2",
  "quent-model",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
 name = "quent-collector"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "quent-collector-client",
  "quent-collector-proto",
@@ -1765,7 +1817,7 @@ dependencies = [
 [[package]]
 name = "quent-collector-client"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "bitcode",
  "http",
@@ -1784,7 +1836,7 @@ dependencies = [
 [[package]]
 name = "quent-collector-proto"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "prost",
  "tonic",
@@ -1795,7 +1847,7 @@ dependencies = [
 [[package]]
 name = "quent-dynamic-attributes"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "serde",
  "thiserror",
@@ -1805,8 +1857,10 @@ dependencies = [
 [[package]]
 name = "quent-events"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
+ "quent-build-info",
+ "quent-dynamic-attributes",
  "quent-time",
  "serde",
  "uuid",
@@ -1815,12 +1869,14 @@ dependencies = [
 [[package]]
 name = "quent-instrumentation"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
+ "async-trait",
  "quent-build-info",
  "quent-dynamic-attributes",
  "quent-events",
  "quent-io",
+ "quent-io-callback",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -1831,7 +1887,7 @@ dependencies = [
 [[package]]
 name = "quent-io"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "async-trait",
  "clap",
@@ -1847,9 +1903,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "quent-io-callback"
+version = "0.1.0"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
+dependencies = [
+ "async-trait",
+ "quent-events",
+ "quent-io-types",
+ "uuid",
+]
+
+[[package]]
 name = "quent-io-collector"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "async-trait",
  "http",
@@ -1864,7 +1931,7 @@ dependencies = [
 [[package]]
 name = "quent-io-msgpack"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "async-trait",
  "quent-events",
@@ -1879,7 +1946,7 @@ dependencies = [
 [[package]]
 name = "quent-io-ndjson"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "async-trait",
  "quent-events",
@@ -1894,7 +1961,7 @@ dependencies = [
 [[package]]
 name = "quent-io-postcard"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "async-trait",
  "postcard",
@@ -1909,7 +1976,7 @@ dependencies = [
 [[package]]
 name = "quent-io-types"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "async-trait",
  "quent-events",
@@ -1921,7 +1988,7 @@ dependencies = [
 [[package]]
 name = "quent-model"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "quent-build-info",
  "quent-collector-client",
@@ -1939,18 +2006,18 @@ dependencies = [
 [[package]]
 name = "quent-model-macros"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "convert_case",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
 name = "quent-query-engine-analyzer"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "quent-analyzer",
  "quent-dynamic-attributes",
@@ -1967,7 +2034,7 @@ dependencies = [
 [[package]]
 name = "quent-query-engine-model"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "quent-model",
  "serde",
@@ -1977,7 +2044,7 @@ dependencies = [
 [[package]]
 name = "quent-query-engine-server"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "axum",
  "mime_guess",
@@ -2009,7 +2076,7 @@ dependencies = [
 [[package]]
 name = "quent-query-engine-ui"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "quent-analyzer",
  "quent-dynamic-attributes",
@@ -2024,7 +2091,7 @@ dependencies = [
 [[package]]
 name = "quent-simulator-ui"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "quent-analyzer",
  "serde",
@@ -2035,8 +2102,9 @@ dependencies = [
 [[package]]
 name = "quent-simulator-ui-bindings"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
+ "nvtx-ui",
  "quent-query-engine-ui",
  "quent-simulator-ui",
  "quent-ui",
@@ -2046,7 +2114,7 @@ dependencies = [
 [[package]]
 name = "quent-time"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "serde",
  "thiserror",
@@ -2056,7 +2124,7 @@ dependencies = [
 [[package]]
 name = "quent-ui"
 version = "0.1.0"
-source = "git+https://github.com/rapidsai/quent.git?rev=2a5ca83442953cbea1c9c53560808104f6b59127#2a5ca83442953cbea1c9c53560808104f6b59127"
+source = "git+https://github.com/rapidsai/quent.git?rev=a872bf1a113c6509ccb4347fc98b067bd6c1829f#a872bf1a113c6509ccb4347fc98b067bd6c1829f"
 dependencies = [
  "quent-analyzer",
  "quent-dynamic-attributes",
@@ -2204,7 +2272,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.60.2",
+ "windows-sys",
 ]
 
 [[package]]
@@ -2395,7 +2463,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys",
 ]
 
 [[package]]
@@ -2414,7 +2482,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.60.2",
+ "windows-sys",
 ]
 
 [[package]]
@@ -2638,7 +2706,7 @@ dependencies = [
  "getrandom",
  "once_cell",
  "rustix",
- "windows-sys 0.60.2",
+ "windows-sys",
 ]
 
 [[package]]
@@ -2710,7 +2778,7 @@ dependencies = [
  "pin-project-lite",
  "socket2",
  "tokio-macros",
- "windows-sys 0.61.2",
+ "windows-sys",
 ]
 
 [[package]]
@@ -2784,7 +2852,7 @@ version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c68f61875ac5293cf72e6c8cf0158086428c82c37229e98c840878f1706b0322"
 dependencies = [
- "prettyplease",
+ "prettyplease 0.2.37",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -2807,7 +2875,7 @@ version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "654e5643eff75d7f8c99197ce1440ed19a3474eada74c12bbac488b2cafdae27"
 dependencies = [
- "prettyplease",
+ "prettyplease 0.2.37",
  "proc-macro2",
  "prost-build",
  "prost-types",
@@ -3170,7 +3238,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys",
 ]
 
 [[package]]
@@ -3181,86 +3249,12 @@ checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 
 [[package]]
 name = "windows-sys"
-version = "0.60.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2f500e4d28234f72040990ec9d39e3a6b950f9f22d3dba18416c35882612bcb"
-dependencies = [
- "windows-targets",
-]
-
-[[package]]
-name = "windows-sys"
 version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
 ]
-
-[[package]]
-name = "windows-targets"
-version = "0.53.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4945f9f551b88e0d65f3db0bc25c33b8acea4d9e41163edf90dcd0b19f9069f3"
-dependencies = [
- "windows-link",
- "windows_aarch64_gnullvm",
- "windows_aarch64_msvc",
- "windows_i686_gnu",
- "windows_i686_gnullvm",
- "windows_i686_msvc",
- "windows_x86_64_gnu",
- "windows_x86_64_gnullvm",
- "windows_x86_64_msvc",
-]
-
-[[package]]
-name = "windows_aarch64_gnullvm"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9d8416fa8b42f5c947f8482c43e7d89e73a173cead56d044f6a56104a6d1b53"
-
-[[package]]
-name = "windows_aarch64_msvc"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9d782e804c2f632e395708e99a94275910eb9100b2114651e04744e9b125006"
-
-[[package]]
-name = "windows_i686_gnu"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "960e6da069d81e09becb0ca57a65220ddff016ff2d6af6a223cf372a506593a3"
-
-[[package]]
-name = "windows_i686_gnullvm"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa7359d10048f68ab8b09fa71c3daccfb0e9b559aed648a8f95469c27057180c"
-
-[[package]]
-name = "windows_i686_msvc"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e7ac75179f18232fe9c285163565a57ef8d3c89254a30685b57d83a38d326c2"
-
-[[package]]
-name = "windows_x86_64_gnu"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c3842cdd74a865a8066ab39c8a7a473c0778a3f29370b5fd6b4b9aa7df4a499"
-
-[[package]]
-name = "windows_x86_64_gnullvm"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ffa179e2d07eee8ad8f57493436566c7cc30ac536a3379fdf008f47f6bb7ae1"
-
-[[package]]
-name = "windows_x86_64_msvc"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 
 [[package]]
 name = "writeable"

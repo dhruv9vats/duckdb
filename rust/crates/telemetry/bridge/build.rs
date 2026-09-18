@@ -1,7 +1,8 @@
 use quent_codegen::CxxOptions;
 
 fn main() {
-    let builder = duckdb_telemetry_model::DuckDBModel::build("DuckDB");
+    let mut builder = duckdb_telemetry_model::DuckDBModel::build("DuckDB");
+    builder.nvtx = false;
     let options = CxxOptions {
         crate_name: "duckdb-telemetry-bridge".into(),
         instrumentation_crate: "duckdb_telemetry_model".into(),

@@ -66,8 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let collector = async {
         collector_service::<DuckDBContext, _>(move |id| {
-            DuckDBContext::try_with_id(id, Some(exporter.clone()))
-                .map_err(|error| error.to_string())
+            DuckDBContext::try_with_id(id, exporter.clone()).map_err(|error| error.to_string())
         })?
         .serve(collector_addr)
         .await
@@ -77,9 +76,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let importer_dir = args.output_dir.clone();
     let index_dir = args.output_dir;
     let importer = move |context_id: Uuid| {
-        Ok(DuckDB::import_events(
-            &importer_dir.join(context_id.to_string()),
-        )?)
+        let events = DuckDB::import_events(&importer_dir.join(context_id.to_string()))?
+            .collect::<quent_io::ImporterResult<Vec<_>>>()?;
+        Ok(Box::new(events.into_iter()) as Box<dyn Iterator<Item = _>>)
     };
     let lister = move || index_query_engines(&index_dir);
     let analyzer = async {

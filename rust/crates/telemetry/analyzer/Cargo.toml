@@ -5,15 +5,15 @@ edition.workspace = true
 
 [dependencies]
 duckdb-telemetry-model = { path = "../model" }
-quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
-quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
-quent-model = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
-quent-query-engine-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
-quent-query-engine-model = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
-quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
-quent-simulator-ui = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
-quent-time = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
-quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "a872bf1a113c6509ccb4347fc98b067bd6c1829f" }
+quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "a872bf1a113c6509ccb4347fc98b067bd6c1829f" }
+quent-model = { git = "https://github.com/rapidsai/quent.git", rev = "a872bf1a113c6509ccb4347fc98b067bd6c1829f" }
+quent-query-engine-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "a872bf1a113c6509ccb4347fc98b067bd6c1829f" }
+quent-query-engine-model = { git = "https://github.com/rapidsai/quent.git", rev = "a872bf1a113c6509ccb4347fc98b067bd6c1829f" }
+quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "a872bf1a113c6509ccb4347fc98b067bd6c1829f" }
+quent-simulator-ui = { git = "https://github.com/rapidsai/quent.git", rev = "a872bf1a113c6509ccb4347fc98b067bd6c1829f" }
+quent-time = { git = "https://github.com/rapidsai/quent.git", rev = "a872bf1a113c6509ccb4347fc98b067bd6c1829f" }
+quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "a872bf1a113c6509ccb4347fc98b067bd6c1829f" }
 tracing = "0.1"
 uuid = "1"
 

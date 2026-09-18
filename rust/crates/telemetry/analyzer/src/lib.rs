@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use duckdb_telemetry_model::{DuckDB, DuckDBEvent, chunk_transfer::ChunkTransferTransition};
 use quent_analyzer::{
     AnalyzerError, AnalyzerResult, Entity, Span,
-    fsm::{FsmTypeDeclaration, FsmUsages, collection::FsmCollection},
+    fsm::{Fsm, FsmTypeDeclaration, FsmUsages, Transition, events::FsmEvents},
     resource::{
         CapacityValue, Usage, Using, collection::ResourceCollection, tree::ResourceTreeNode,
     },
@@ -13,6 +13,7 @@ use quent_analyzer::{
     },
 };
 use quent_events::Event;
+use quent_model::analyze::TransitionInfo;
 pub use quent_query_engine_analyzer::QueryEngineModel;
 use quent_query_engine_analyzer::entities;
 use quent_query_engine_analyzer::ui::{QuentViewer, UiAnalyzer, ViewerEventStream};
@@ -24,10 +25,17 @@ use quent_query_engine_ui::{
     DataFlowTimelineBinned, OperatorFilter, QueryBundle, QueryEntities, QueryFilter,
 };
 use quent_simulator_ui::EntityRef;
-use quent_time::{TimeUnixNanoSec, span::SpanUnixNanoSec, to_nanosecs, to_secs};
+use quent_time::{
+    TimeNanoSec, TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec, to_nanosecs, to_secs,
+    try_to_secs_relative,
+};
 use quent_ui::{
-    FiniteStateMachine, ResourceGroupNode, ResourceTree, convert_resource_tree,
-    entities::{request::EntityListRequest, response::EntityListResponse},
+    FiniteStateMachine, FsmTransition, FsmUsage, ResourceGroupNode, ResourceTree,
+    convert_resource_tree,
+    entities::{
+        request::{EntityListRequest, EntitySortKey, SortDir},
+        response::{EntityListItem, EntityListResponse},
+    },
     quantity::{CapacityKind, PrefixSystem, QuantitySpec},
     timeline::{
         categorical::{
@@ -83,7 +91,9 @@ impl QuentViewer for Viewer {
     fn import_events(
         dir: &std::path::Path,
     ) -> quent_model::io::ImporterResult<ViewerEventStream<Self::Analyzer>> {
-        DuckDB::import_events(dir)
+        let events =
+            DuckDB::import_events(dir)?.collect::<quent_model::io::ImporterResult<Vec<_>>>()?;
+        Ok(Box::new(events.into_iter()))
     }
 }
 
@@ -92,44 +102,133 @@ pub struct DuckDbUiAnalyzer {
     pub model: DuckDbModel,
 }
 
-struct PipelineTaskCollection<'a>(&'a std::collections::HashMap<Uuid, PipelineTask>);
+/// Convert a DuckDB FSM into a UI FSM, attaching each transition's own usages.
+///
+/// This intentionally does not reuse Quent's `try_from_fsm`, which groups usages
+/// by state name onto the first transition of that name. DuckDB FSMs (e.g.
+/// pipeline tasks) reuse state names as they oscillate between running/ready/
+/// blocked, so name-based grouping collapses every interval's usages onto the
+/// first occurrence and the UI drops the later intervals. When `clip` is set,
+/// transition timestamps are clamped into it so engine-lived, pre-epoch FSMs
+/// (memory accounts) stay non-negative relative to the epoch.
+fn fsm_to_ui<T: TransitionInfo>(
+    fsm: &FsmEvents<T>,
+    epoch: TimeUnixNanoSec,
+    clip: Option<SpanUnixNanoSec>,
+) -> AnalyzerResult<FiniteStateMachine> {
+    let transitions = (0..=fsm.len())
+        .filter_map(|index| fsm.transition(index))
+        .map(|transition| {
+            let timestamp = match clip {
+                Some(span) => transition.timestamp().clamp(span.start(), span.end()),
+                None => transition.timestamp(),
+            };
+            Ok(FsmTransition {
+                name: transition.name().to_owned(),
+                usages: transition
+                    .usages
+                    .iter()
+                    .map(|usage| FsmUsage {
+                        resource: usage.resource_id,
+                        capacities: usage
+                            .capacities
+                            .iter()
+                            .map(|capacity| (capacity.name.to_string(), capacity.value))
+                            .collect(),
+                    })
+                    .collect(),
+                timestamp: try_to_secs_relative(timestamp, epoch)?,
+                attributes: transition.attributes(),
+                derived_attributes: vec![],
+            })
+        })
+        .collect::<Result<Vec<_>, quent_time::TimeError>>()?;
 
-impl FsmCollection for PipelineTaskCollection<'_> {
-    type Fsm = PipelineTask;
-
-    fn fsms(&self) -> impl Iterator<Item = &PipelineTask> {
-        self.0.values()
-    }
+    Ok(FiniteStateMachine {
+        id: fsm.id(),
+        type_name: fsm.type_name().to_owned(),
+        instance_name: fsm.instance_name().to_owned(),
+        transitions,
+    })
 }
 
-struct ChunkTransferCollection<'a>(&'a std::collections::HashMap<Uuid, ChunkTransfer>);
+/// List the FSMs matching `keep`, scope, window, and filters, ranked by longest
+/// in-window usage and paged. Mirrors Quent's generic `list_entities` but builds
+/// UI FSMs via [`fsm_to_ui`] so per-transition usages survive (and optionally
+/// clips engine-lived FSMs into `clip`).
+fn list_fsms<'a, T, P>(
+    fsms: impl Iterator<Item = &'a FsmEvents<T>>,
+    keep: P,
+    query: &entities::ListQuery<'_>,
+    clip: Option<SpanUnixNanoSec>,
+) -> AnalyzerResult<EntityListResponse>
+where
+    T: TransitionInfo + 'a,
+    P: Fn(&FsmEvents<T>) -> bool,
+{
+    let min_usage = query.filter.min_usage_s.map(to_nanosecs);
+    let mut ranked: Vec<(&'a FsmEvents<T>, TimeNanoSec)> = fsms
+        .filter(|fsm| keep(fsm))
+        .filter_map(|fsm| {
+            let longest = fsm
+                .usages_with_state_names()
+                .filter(|(_, usage)| {
+                    query
+                        .scope
+                        .is_none_or(|scope| scope.contains(&usage.resource_id()))
+                })
+                .filter_map(|(_, usage)| usage.span().intersection(&query.window))
+                .map(|span| span.duration())
+                .max();
+            // With a scope an FSM must use a scoped resource; without one, keep
+            // FSMs whose lifecycle overlaps the window.
+            let metric = match query.scope {
+                Some(_) => longest?,
+                None => {
+                    if !fsm.span().is_ok_and(|span| span.intersects(&query.window)) {
+                        return None;
+                    }
+                    longest.unwrap_or(0)
+                }
+            };
+            min_usage
+                .is_none_or(|min| metric >= min)
+                .then_some((fsm, metric))
+        })
+        .collect();
 
-impl FsmCollection for ChunkTransferCollection<'_> {
-    type Fsm = ChunkTransfer;
+    ranked.sort_by(|(fsm_a, metric_a), (fsm_b, metric_b)| {
+        let ordering = match query.sort.key {
+            EntitySortKey::UsageDuration => metric_a.cmp(metric_b),
+        };
+        let ordering = match query.sort.dir {
+            SortDir::Asc => ordering,
+            SortDir::Desc => ordering.reverse(),
+        };
+        ordering.then_with(|| fsm_a.id().cmp(&fsm_b.id()))
+    });
 
-    fn fsms(&self) -> impl Iterator<Item = &ChunkTransfer> {
-        self.0.values()
-    }
-}
+    let total = ranked.len() as u32;
+    let page: Box<dyn Iterator<Item = (&FsmEvents<T>, TimeNanoSec)>> = match query.page {
+        Some(page) => Box::new(
+            ranked
+                .into_iter()
+                .skip(page.page.saturating_mul(page.max) as usize)
+                .take(page.max as usize),
+        ),
+        None => Box::new(ranked.into_iter()),
+    };
 
-struct OperatorInvocationCollection<'a>(&'a std::collections::HashMap<Uuid, OperatorInvocation>);
+    let items = page
+        .map(|(fsm, metric)| {
+            fsm_to_ui(fsm, query.epoch, clip).map(|entity| EntityListItem {
+                usage_duration_s: to_secs(metric),
+                entity,
+            })
+        })
+        .collect::<AnalyzerResult<Vec<_>>>()?;
 
-impl FsmCollection for OperatorInvocationCollection<'_> {
-    type Fsm = OperatorInvocation;
-
-    fn fsms(&self) -> impl Iterator<Item = &OperatorInvocation> {
-        self.0.values()
-    }
-}
-
-struct TemporaryBlockIoCollection<'a>(&'a std::collections::HashMap<Uuid, TemporaryBlockIo>);
-
-impl FsmCollection for TemporaryBlockIoCollection<'_> {
-    type Fsm = TemporaryBlockIo;
-
-    fn fsms(&self) -> impl Iterator<Item = &TemporaryBlockIo> {
-        self.0.values()
-    }
+    Ok(EntityListResponse { items, total })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,9 +512,17 @@ impl UiAnalyzer for DuckDbUiAnalyzer {
             epoch,
         };
 
-        match entry.filter.entity_type_name.as_deref() {
-            None | Some(PIPELINE_TASK_TYPE_NAME) => entities::list_entities(
-                &PipelineTaskCollection(&self.model.pipeline_tasks),
+        // The Quent long-entities row omits the entity type; default it from
+        // the scoped resource so each resource lists its own entities (e.g.
+        // memory resources list memory accounts).
+        let entity_type = match entry.filter.entity_type_name.as_deref() {
+            Some(name) => name.to_owned(),
+            None => self.default_scope_entity_type(scope.as_ref()),
+        };
+
+        match entity_type.as_str() {
+            PIPELINE_TASK_TYPE_NAME => list_fsms(
+                self.model.pipeline_tasks.values(),
                 |task| {
                     task.query_id() == Some(query_id)
                         && task.is_complete()
@@ -428,10 +535,11 @@ impl UiAnalyzer for DuckDbUiAnalyzer {
                         && task.matches_operator(&filter)
                         && task.span().is_ok_and(|span| span.intersects(&window))
                 },
-                query,
+                &query,
+                None,
             ),
-            Some(CHUNK_TRANSFER_TYPE_NAME) => entities::list_entities(
-                &ChunkTransferCollection(&self.model.chunk_transfers),
+            CHUNK_TRANSFER_TYPE_NAME => list_fsms(
+                self.model.chunk_transfers.values(),
                 |transfer| {
                     transfer.query_id() == Some(query_id)
                         && transfer.is_complete()
@@ -443,10 +551,11 @@ impl UiAnalyzer for DuckDbUiAnalyzer {
                         && transfer.matches_operator(&filter)
                         && transfer.span().is_ok_and(|span| span.intersects(&window))
                 },
-                query,
+                &query,
+                None,
             ),
-            Some(OPERATOR_INVOCATION_TYPE_NAME) => entities::list_entities(
-                &OperatorInvocationCollection(&self.model.operator_invocations),
+            OPERATOR_INVOCATION_TYPE_NAME => list_fsms(
+                self.model.operator_invocations.values(),
                 |invocation| {
                     invocation.query_id() == Some(query_id)
                         && invocation.is_complete()
@@ -463,24 +572,31 @@ impl UiAnalyzer for DuckDbUiAnalyzer {
                         && invocation.matches_operator(&filter)
                         && invocation.span().is_ok_and(|span| span.intersects(&window))
                 },
-                query,
+                &query,
+                None,
             ),
-            Some(TEMPORARY_BLOCK_IO_TYPE_NAME) => entities::list_entities(
-                &TemporaryBlockIoCollection(&self.model.temporary_block_ios),
+            TEMPORARY_BLOCK_IO_TYPE_NAME => list_fsms(
+                self.model.temporary_block_ios.values(),
                 |io| {
                     self.temporary_io_matches(io, query_id, &topology, &tasks, &filter)
                         && io.span().is_ok_and(|span| span.intersects(&window))
                 },
-                query,
+                &query,
+                None,
             ),
-            // Accounts are engine-lived and begin before the query epoch. They
-            // power query-clipped timelines but cannot be rendered as query FSMs.
-            Some(MEMORY_ACCOUNT_TYPE_NAME) => Ok(EntityListResponse {
-                items: vec![],
-                total: 0,
-            }),
-            Some(type_name) => Err(AnalyzerError::InvalidArgument(format!(
-                "unknown DuckDB entity type {type_name:?}"
+            // Accounts are engine-lived and begin before the query epoch, so
+            // their transitions are clipped into the query span to list them.
+            MEMORY_ACCOUNT_TYPE_NAME => {
+                let query_span = self.model.query(query_id)?.span()?;
+                list_fsms(
+                    self.model.memory_accounts.values(),
+                    |account| self.memory_account_matches(account, &filter),
+                    &query,
+                    Some(query_span),
+                )
+            }
+            other => Err(AnalyzerError::InvalidArgument(format!(
+                "unknown DuckDB entity type {other:?}"
             ))),
         }
     }
@@ -952,6 +1068,37 @@ impl DuckDbUiAnalyzer {
             && account.matches_operator(filter)
     }
 
+    /// The default entity type to list for a resource scope: a resource type's
+    /// sole `used_by` entity type, matching the Quent UI's per-resource default.
+    /// Falls back to pipeline tasks for unscoped or multi-entity resources.
+    fn default_scope_entity_type(&self, scope: Option<&HashSet<Uuid>>) -> String {
+        let Some(resource_ids) = scope else {
+            return PIPELINE_TASK_TYPE_NAME.to_owned();
+        };
+        let mut chosen: Option<String> = None;
+        for resource_id in resource_ids {
+            let Ok(resource_type) = self.model.resource_type_of(*resource_id) else {
+                return PIPELINE_TASK_TYPE_NAME.to_owned();
+            };
+            if resource_type.used_by.len() != 1 {
+                return PIPELINE_TASK_TYPE_NAME.to_owned();
+            }
+            let used_by = resource_type
+                .used_by
+                .iter()
+                .next()
+                .expect("len == 1")
+                .clone();
+            match &chosen {
+                Some(existing) if *existing != used_by => {
+                    return PIPELINE_TASK_TYPE_NAME.to_owned();
+                }
+                _ => chosen = Some(used_by),
+            }
+        }
+        chosen.unwrap_or_else(|| PIPELINE_TASK_TYPE_NAME.to_owned())
+    }
+
     fn entities_to_ui(
         &self,
         entity_ids: &[Uuid],
@@ -961,18 +1108,17 @@ impl DuckDbUiAnalyzer {
             .iter()
             .filter_map(|id| {
                 if let Some(task) = self.model.pipeline_tasks.get(id) {
-                    return Some(FiniteStateMachine::try_from_fsm(task, epoch));
+                    return Some(fsm_to_ui(task, epoch, None));
                 }
                 if let Some(io) = self.model.temporary_block_ios.get(id) {
-                    return Some(FiniteStateMachine::try_from_fsm(io, epoch));
+                    return Some(fsm_to_ui(io, epoch, None));
                 }
                 self.model
                     .operator_invocations
                     .get(id)
-                    .map(|invocation| FiniteStateMachine::try_from_fsm(invocation, epoch))
+                    .map(|invocation| fsm_to_ui(invocation, epoch, None))
             })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
+            .collect::<AnalyzerResult<Vec<_>>>()
     }
 
     fn timeline_to_ui(
@@ -1142,7 +1288,7 @@ mod tests {
     };
     use quent_model::{Capacity, FsmEvent, Ref, Usage};
     use quent_ui::entities::request::{
-        EntityListEntry, EntityListFilter, EntitySortKey, Sort, SortDir, TimeWindow,
+        EntityListEntry, EntityListFilter, EntityScope, EntitySortKey, Sort, SortDir, TimeWindow,
     };
     use quent_ui::timeline::request::{
         EntityFilter, ResourceGroupTimelineRequest, ResourceTimelineRequest, TimelineConfig,
@@ -2168,6 +2314,31 @@ mod tests {
         }
     }
 
+    fn scoped_list_request(resource_id: Uuid) -> EntityListRequest<QueryFilter, OperatorFilter> {
+        EntityListRequest {
+            app_params: QueryFilter { query_id: QUERY_ID },
+            entry: EntityListEntry {
+                window: TimeWindow {
+                    start: 0.0,
+                    end: 1.0,
+                },
+                filter: EntityListFilter {
+                    entity_type_name: None,
+                    scope: Some(EntityScope::Resource { resource_id }),
+                    ..Default::default()
+                },
+                sort: Sort {
+                    key: EntitySortKey::UsageDuration,
+                    dir: SortDir::Desc,
+                },
+                page: None,
+                application: OperatorFilter {
+                    operator_ids: vec![],
+                },
+            },
+        }
+    }
+
     fn single_resource_request(
         resource_id: Uuid,
         entity_type_name: Option<&str>,
@@ -2358,13 +2529,45 @@ mod tests {
     }
 
     #[test]
-    fn prequery_memory_accounts_are_timeline_only() {
-        let accounts = memory_analyzer(true)
+    fn memory_accounts_are_listable() {
+        let analyzer = memory_analyzer(true);
+
+        // Every engine-lived account lists without a scope or explicit type.
+        let all = analyzer
             .list_entities(list_request(MEMORY_ACCOUNT_TYPE_NAME, vec![]))
             .unwrap();
+        assert_eq!(all.total, 4);
+        assert!(
+            all.items
+                .iter()
+                .all(|item| item.entity.type_name == MEMORY_ACCOUNT_TYPE_NAME)
+        );
+        // Transitions are clipped into the query span, so the pre-epoch
+        // registration lands at the query start and no timestamp is negative.
+        assert!(all.items.iter().all(|item| {
+            item.entity
+                .transitions
+                .first()
+                .is_some_and(|transition| transition.timestamp == 0.0)
+                && item
+                    .entity
+                    .transitions
+                    .iter()
+                    .all(|transition| transition.timestamp >= 0.0)
+        }));
 
-        assert_eq!(accounts.total, 0);
-        assert!(accounts.items.is_empty());
+        // A memory-resource scope defaults to its accounts even when the request
+        // omits the entity type, as the Quent long-entities row does.
+        let buffer_pool = analyzer
+            .list_entities(scoped_list_request(BUFFER_POOL_MEMORY_ID))
+            .unwrap();
+        assert_eq!(buffer_pool.total, 2);
+        assert!(
+            buffer_pool
+                .items
+                .iter()
+                .all(|item| item.entity.type_name == MEMORY_ACCOUNT_TYPE_NAME)
+        );
     }
 
     #[test]
@@ -2768,6 +2971,46 @@ mod tests {
         assert_eq!(tasks.items.len(), 1);
         assert_eq!(invocations.total, 1);
         assert_eq!(invocations.items.len(), 1);
+    }
+
+    #[test]
+    fn repeated_state_usages_stay_on_their_own_transitions() {
+        // The fixture task oscillates through `running` three times and runs on
+        // EXECUTION_THREAD_ID at two of them. Each running transition must keep
+        // its own thread usage instead of collapsing onto the first occurrence.
+        let tasks = analyzer()
+            .list_entities(list_request(PIPELINE_TASK_TYPE_NAME, vec![]))
+            .unwrap();
+        let task = tasks
+            .items
+            .iter()
+            .map(|item| &item.entity)
+            .find(|fsm| {
+                fsm.transitions
+                    .iter()
+                    .filter(|t| t.name == "running")
+                    .count()
+                    >= 3
+            })
+            .expect("fixture task with repeated running states");
+
+        let running_on_thread = task
+            .transitions
+            .iter()
+            .filter(|t| {
+                t.name == "running" && t.usages.iter().any(|u| u.resource == EXECUTION_THREAD_ID)
+            })
+            .count();
+        assert_eq!(running_on_thread, 2);
+
+        // The final running transition (emptied by name-grouping) keeps its usage.
+        let last_running = task
+            .transitions
+            .iter()
+            .rev()
+            .find(|t| t.name == "running")
+            .unwrap();
+        assert!(!last_running.usages.is_empty());
     }
 
     #[test]

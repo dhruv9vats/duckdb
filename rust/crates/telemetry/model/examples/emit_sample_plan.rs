@@ -31,7 +31,10 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let ctx = DuckDBContext::try_new(args.exporter.into_options())?;
+    let ctx = match args.exporter.into_options() {
+        Some(provider) => DuckDBContext::try_new(provider)?,
+        None => DuckDBContext::try_new(quent_model::Noop)?,
+    };
 
     let engine_observer = ctx.engine_observer();
     let worker_observer = ctx.worker_observer();
