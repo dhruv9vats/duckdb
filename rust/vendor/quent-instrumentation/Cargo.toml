@@ -1,0 +1,56 @@
+[package]
+name = "quent-instrumentation"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+serde = [
+    "dep:serde",
+    "quent-events/serde",
+    "quent-dynamic-attributes/serde",
+    "uuid/serde",
+]
+# Optional I/O integrations.
+io-callback = ["dep:quent-io-callback"]
+io-ndjson = ["quent-io/ndjson", "serde"]
+io-msgpack = ["quent-io/msgpack", "serde"]
+io-postcard = ["quent-io/postcard", "serde"]
+io-collector = ["dep:quent-collector-client", "quent-io/collector", "serde"]
+
+[dependencies]
+async-trait = "0.1"
+quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+quent-build-info = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+quent-collector-client = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", optional = true }
+quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", default-features = false }
+quent-io-callback = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync", "macros"]}
+tokio-util = "0.7"
+tracing = "0.1"
+uuid = { version = "1", features = ["serde"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+http = "1"
+pprof = { version = "0.15", features = ["flamegraph"] }
+quent-collector = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+quent-collector-proto = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", features = ["serde"] }
+quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", features = ["ndjson"] }
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-stream = "0.1"
+tonic = "0.14"
+
+[[bench]]
+name = "event_emit"
+harness = false

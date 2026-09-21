@@ -1,0 +1,31 @@
+[package]
+name = "duckdb-telemetry-bridge"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "duckdb_telemetry_bridge"
+crate-type = ["staticlib"]
+
+[features]
+browser = ["duckdb-telemetry-model/browser", "quent-instrumentation/io-callback", "dep:postcard"]
+
+[dependencies]
+cxx.workspace = true
+duckdb-telemetry-model = { path = "../model" }
+quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+quent-time = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+postcard = { version = "1", features = ["alloc"], optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", features = ["io-collector", "io-msgpack", "io-ndjson", "io-postcard"] }
+quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", features = ["collector", "msgpack", "ndjson", "postcard"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", default-features = false }
+quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", default-features = false }
+
+[build-dependencies]
+cxx-build.workspace = true
+quent-schema-codegen-cpp = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }

@@ -487,7 +487,14 @@ void TemporaryFileCompressionAdaptivity::Update(const TemporaryCompressionLevel 
 //===--------------------------------------------------------------------===//
 TemporaryFileManager::TemporaryFileManager(DatabaseInstance &db, const string &temp_directory_p,
                                            atomic<idx_t> &size_on_disk_p)
-    : db(db), temp_directory(temp_directory_p), files(*this), size_on_disk(size_on_disk_p), max_swap_space(0) {
+    : TemporaryFileManager(db, temp_directory_p, size_on_disk_p, nullptr) {
+}
+
+TemporaryFileManager::TemporaryFileManager(DatabaseInstance &db, const string &temp_directory_p,
+                                           atomic<idx_t> &size_on_disk_p,
+                                           shared_ptr<MemoryUsageProbe> memory_usage_probe_p)
+    : db(db), temp_directory(temp_directory_p), files(*this), size_on_disk(size_on_disk_p), max_swap_space(0),
+      memory_usage_probe(std::move(memory_usage_probe_p)) {
 }
 
 TemporaryFileManager::~TemporaryFileManager() {
@@ -601,6 +608,11 @@ static idx_t GetDefaultMax(const string &path) {
 }
 
 void TemporaryFileManager::SetMaxSwapSpace(optional_idx limit) {
+	unique_lock<mutex> probe_guard(memory_usage_probe_lock, std::defer_lock);
+	if (memory_usage_probe) {
+		probe_guard.lock();
+	}
+
 	idx_t new_limit;
 	if (limit.IsValid()) {
 		new_limit = limit.GetIndex();
@@ -620,9 +632,17 @@ To get usage information of the temp_directory, use 'CALL duckdb_temporary_files
 		    used, max);
 	}
 	max_swap_space = new_limit;
+	if (memory_usage_probe) {
+		memory_usage_probe->TemporaryStorageLimit(new_limit);
+	}
 }
 
 void TemporaryFileManager::IncreaseSizeOnDisk(idx_t bytes) {
+	unique_lock<mutex> probe_guard(memory_usage_probe_lock, std::defer_lock);
+	if (memory_usage_probe) {
+		probe_guard.lock();
+	}
+
 	auto current_size_on_disk = GetTotalUsedSpaceInBytes();
 	if (current_size_on_disk + bytes > max_swap_space) {
 		auto used = StringUtil::BytesToHumanReadableString(current_size_on_disk);
@@ -635,10 +655,21 @@ You can adjust this setting, by using (for example) PRAGMA max_temp_directory_si
 		                           data_size, used, max);
 	}
 	size_on_disk += bytes;
+	if (memory_usage_probe) {
+		memory_usage_probe->TemporaryDirectoryDelta(NumericCast<int64_t>(bytes));
+	}
 }
 
 void TemporaryFileManager::DecreaseSizeOnDisk(idx_t bytes) {
+	unique_lock<mutex> probe_guard(memory_usage_probe_lock, std::defer_lock);
+	if (memory_usage_probe) {
+		probe_guard.lock();
+	}
+
 	size_on_disk -= bytes;
+	if (memory_usage_probe) {
+		memory_usage_probe->TemporaryDirectoryDelta(-NumericCast<int64_t>(bytes));
+	}
 }
 
 bool TemporaryFileManager::IsEncrypted() const {
@@ -731,8 +762,14 @@ void TemporaryFileManager::EraseFileHandle(TemporaryFileManagerLock &, const Tem
 //===--------------------------------------------------------------------===//
 TemporaryDirectoryHandle::TemporaryDirectoryHandle(DatabaseInstance &db, string path_p, atomic<idx_t> &size_on_disk,
                                                    optional_idx max_swap_space)
+    : TemporaryDirectoryHandle(db, std::move(path_p), size_on_disk, max_swap_space, nullptr) {
+}
+
+TemporaryDirectoryHandle::TemporaryDirectoryHandle(DatabaseInstance &db, string path_p, atomic<idx_t> &size_on_disk,
+                                                   optional_idx max_swap_space,
+                                                   shared_ptr<MemoryUsageProbe> memory_usage_probe)
     : db(db), temp_directory(std::move(path_p)),
-      temp_file(make_uniq<TemporaryFileManager>(db, temp_directory, size_on_disk)) {
+      temp_file(make_uniq<TemporaryFileManager>(db, temp_directory, size_on_disk, std::move(memory_usage_probe))) {
 	auto &fs = FileSystem::GetFileSystem(db);
 	D_ASSERT(!temp_directory.empty());
 	if (!fs.DirectoryExists(temp_directory)) {

@@ -17,6 +17,7 @@
 #include "duckdb/common/typedefs.hpp"
 #include "duckdb/storage/buffer/block_handle.hpp"
 #include "duckdb/storage/buffer/temporary_file_information.hpp"
+#include "duckdb/storage/memory_usage_probe.hpp"
 
 namespace duckdb {
 
@@ -79,6 +80,8 @@ public:
 	}
 
 protected:
+	void RegisterMemoryUsageProbe(const shared_ptr<MemoryUsageProbe> &probe);
+
 	//! Evict blocks until the currently used memory + extra_memory fit, returns false if this was not possible
 	//! (i.e. not enough blocks could be evicted)
 	//! If the "buffer" argument is specified AND the system can find a buffer to re-use for the given allocation size
@@ -185,6 +188,10 @@ protected:
 	BlockAllocator &block_allocator;
 	//! Per-database singleton object cache managed by buffer pool.
 	optional_ptr<ObjectCache> object_cache = nullptr;
+	//! Memory accounting observers, normally one per database telemetry context.
+	mutex memory_usage_probes_lock;
+	vector<weak_ptr<MemoryUsageProbe>> memory_usage_probes;
+	atomic<idx_t> memory_usage_probe_count {0};
 };
 
 } // namespace duckdb

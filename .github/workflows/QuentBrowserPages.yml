@@ -1,0 +1,91 @@
+name: Quent browser Pages
+
+on:
+  push:
+    branches:
+      - quent
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy the verified artifact to GitHub Pages
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    concurrency:
+      group: ${{ github.workflow }}-build-${{ github.ref }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    env:
+      DUCKDB_TELEMETRY_BUILD_ID: ${{ github.sha }}+browser-v1
+    defaults:
+      run:
+        working-directory: tools/quent-browser
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.11.0
+          cache: pnpm
+          cache-dependency-path: tools/quent-browser/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          targets: wasm32-unknown-unknown,wasm32-unknown-emscripten
+          components: rust-src
+      - uses: emscripten-core/setup-emsdk@v16
+        with:
+          version: 6.0.9
+      - run: cargo install wasm-bindgen-cli --version 0.2.127 --locked
+      - run: bash scripts/prepare-quent.sh
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm analyzer:build
+      - run: bash scripts/build-producer.sh
+      - run: pnpm test
+      - run: pnpm build
+      - run: pnpm exec playwright install --with-deps chromium firefox webkit
+      - run: QUENT_REAL_ANALYZER=1 QUENT_REAL_PRODUCER=1 pnpm test:e2e
+      - name: Upload browser diagnostics
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: quent-browser-diagnostics-${{ github.run_attempt }}
+          path: |
+            tools/quent-browser/playwright-report
+            tools/quent-browser/test-results
+          if-no-files-found: ignore
+          retention-days: 7
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: tools/quent-browser/dist
+
+  deploy:
+    if: >-
+      github.ref == 'refs/heads/quent' &&
+      (github.event_name == 'push' || inputs.deploy == true)
+    needs: build
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: quent-browser-pages
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

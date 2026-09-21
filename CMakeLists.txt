@@ -70,7 +70,7 @@ if(DEFINED CMAKE_CXX_STANDARD)
   endif()
 endif()
 
-set(CMAKE_CXX_STANDARD 17 CACHE STRING "Default C++ standard (minimum 17)")                                                                                                             
+set(CMAKE_CXX_STANDARD 17 CACHE STRING "Default C++ standard (minimum 17)")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -581,6 +581,12 @@ message(STATUS "git hash ${GIT_COMMIT_HASH}, version ${DUCKDB_VERSION}, extensio
 option(BUILD_MAIN_DUCKDB_LIBRARY
         "Build the main duckdb library and executable."
         TRUE)
+option(BUILD_QUENT_TELEMETRY
+       "Build and link the experimental Quent telemetry bridge."
+       TRUE)
+option(BUILD_QUENT_BROWSER_TELEMETRY
+       "Enable the browser-only Quent in-memory telemetry exporter."
+       FALSE)
 option(BUILD_EXTENSIONS_ONLY "Build all extension as linkable, overriding DONT_LINK, and don't build core." FALSE)
 option(BUILD_BENCHMARKS "Enable building of the benchmark suite." FALSE)
 option(DISABLE_BUILTIN_EXTENSIONS "Disable linking extensions." FALSE)
@@ -1096,6 +1102,19 @@ if(PREBUILT_BINARY)
 elseif (BUILD_MAIN_DUCKDB_LIBRARY)
   add_subdirectory(src)
 
+  if(BUILD_QUENT_TELEMETRY)
+    add_subdirectory(rust/crates/telemetry/bridge)
+    target_link_libraries(duckdb PRIVATE duckdb_telemetry_bridge)
+    target_link_libraries(duckdb_static PRIVATE duckdb_telemetry_bridge)
+    target_link_libraries(duckdb_main PRIVATE duckdb_telemetry_bridge)
+    target_compile_features(duckdb_main PRIVATE cxx_std_20)
+    target_compile_definitions(duckdb_main PRIVATE DUCKDB_QUENT_TELEMETRY)
+    target_compile_definitions(duckdb_parallel PRIVATE DUCKDB_QUENT_TELEMETRY)
+    if(EMSCRIPTEN AND BUILD_QUENT_BROWSER_TELEMETRY)
+      target_compile_definitions(duckdb_main PRIVATE DUCKDB_QUENT_BROWSER_TELEMETRY)
+    endif()
+  endif()
+
   add_subdirectory(tools)
   add_subdirectory(extension)
 endif()
@@ -1156,6 +1175,12 @@ if (NOT ${EXTENSION_CONFIG_BUILD})
          FILE "${PROJECT_BINARY_DIR}/${DUCKDB_EXPORT_SET}.cmake")
 endif()
 
+if(TARGET duckdb_telemetry_bridge)
+  install(
+    FILES "${PROJECT_BINARY_DIR}/corrosion/${DUCKDB_EXPORT_SET}Corrosion.cmake"
+    DESTINATION "${INSTALL_CMAKE_DIR}/corrosion")
+endif()
+
 # Only write the cmake package configuration if the templates exist
 set(CMAKE_CONFIG_TEMPLATE "${CMAKE_CURRENT_SOURCE_DIR}/DuckDBConfig.cmake.in")
 set(CMAKE_CONFIG_VERSION_TEMPLATE
@@ -1164,6 +1189,12 @@ if(EXISTS ${CMAKE_CONFIG_TEMPLATE} AND EXISTS ${CMAKE_CONFIG_VERSION_TEMPLATE})
 
   # Configure cmake package config for the build tree
   set(CONF_INCLUDE_DIRS "${PROJECT_SOURCE_DIR}/src/include")
+  if(TARGET duckdb_telemetry_bridge)
+    set(DUCKDB_QUENT_CONFIG_INCLUDE
+        "set(PACKAGE_PREFIX_DIR \"${PROJECT_BINARY_DIR}\")\n    include(\"\${DuckDB_CMAKE_DIR}/corrosion/${DUCKDB_EXPORT_SET}Corrosion.cmake\")")
+  else()
+    set(DUCKDB_QUENT_CONFIG_INCLUDE "")
+  endif()
   configure_file(${CMAKE_CONFIG_TEMPLATE}
                  "${PROJECT_BINARY_DIR}/DuckDBConfig.cmake" @ONLY)
 
@@ -1171,6 +1202,13 @@ if(EXISTS ${CMAKE_CONFIG_TEMPLATE} AND EXISTS ${CMAKE_CONFIG_VERSION_TEMPLATE})
   file(RELATIVE_PATH REL_INCLUDE_DIR "${CMAKE_INSTALL_PREFIX}/${INSTALL_CMAKE_DIR}"
     "${CMAKE_INSTALL_PREFIX}/${INSTALL_INCLUDE_DIR}")
   set(CONF_INCLUDE_DIRS "\${DuckDB_CMAKE_DIR}/${REL_INCLUDE_DIR}")
+  if(TARGET duckdb_telemetry_bridge)
+    file(RELATIVE_PATH DUCKDB_PACKAGE_PREFIX_RELATIVE
+         "${CMAKE_INSTALL_PREFIX}/${INSTALL_CMAKE_DIR}"
+         "${CMAKE_INSTALL_PREFIX}")
+    set(DUCKDB_QUENT_CONFIG_INCLUDE
+        "get_filename_component(PACKAGE_PREFIX_DIR \"\${DuckDB_CMAKE_DIR}/${DUCKDB_PACKAGE_PREFIX_RELATIVE}\" ABSOLUTE)\n    include(\"\${DuckDB_CMAKE_DIR}/corrosion/${DUCKDB_EXPORT_SET}Corrosion.cmake\")")
+  endif()
   configure_file(
     ${CMAKE_CONFIG_TEMPLATE}
     "${PROJECT_BINARY_DIR}${CMAKE_FILES_DIRECTORY}/DuckDBConfig.cmake" @ONLY)

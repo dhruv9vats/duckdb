@@ -1,0 +1,57 @@
+{
+  "init": {
+    "protocol_version": 1,
+    "schema_hash": "d5dfec3faf35450fad26e546879bac257908f516f4d4539866f62acb0072ad42",
+    "build_id": "f7fa1af315c37f2112c87d3cff7849889f835c37+browser-v1"
+  },
+  "ingest": {
+    "header": {
+      "protocol_version": 1,
+      "schema_hash": "d5dfec3faf35450fad26e546879bac257908f516f4d4539866f62acb0072ad42",
+      "capture_id": "10000000-0000-0000-0000-000000000001",
+      "run_id": "20000000-0000-0000-0000-000000000001",
+      "context_id": "30000000-0000-0000-0000-000000000001",
+      "seq": "0",
+      "event_count": 1,
+      "payload_len": 39,
+      "min_ts_ns": "9007199254740993",
+      "max_ts_ns": "9007199254740993",
+      "overflowed": false
+    },
+    "payload": "postcard(Vec<Event<DuckDbEvent>>)"
+  },
+  "batch_ack": {
+    "capture_id": "10000000-0000-0000-0000-000000000001",
+    "acked_seq": "0"
+  },
+  "seal": {
+    "capture_id": "10000000-0000-0000-0000-000000000001",
+    "final_seq": "0",
+    "watermark_ns": "9007199254741993",
+    "query_ids": ["40000000-0000-0000-0000-000000000001"],
+    "outcome": "success",
+    "overflowed": false
+  },
+  "seal_ack": {
+    "capture_id": "10000000-0000-0000-0000-000000000001",
+    "acked_seq": "0",
+    "revision": "1",
+    "state": "sealed",
+    "query_ids": ["40000000-0000-0000-0000-000000000001"]
+  },
+  "empty_seal": {
+    "capture_id": "10000000-0000-0000-0000-000000000002",
+    "final_seq": null,
+    "watermark_ns": "9007199254741993",
+    "query_ids": [],
+    "outcome": "failed",
+    "overflowed": false
+  },
+  "request": {
+    "revision": "1",
+    "method": "GET",
+    "route": "/api/engines/50000000-0000-0000-0000-000000000001/query/40000000-0000-0000-0000-000000000001",
+    "params": {},
+    "body": null
+  }
+}

@@ -323,7 +323,62 @@ void BufferPool::IncrementDeadNodes(const BlockMemory &memory) {
 }
 
 void BufferPool::UpdateUsedMemory(MemoryTag tag, int64_t size) {
+	if (size == 0) {
+		memory_usage.UpdateUsedMemory(tag, size);
+		return;
+	}
+	if (memory_usage_probe_count.load() == 0) {
+		memory_usage.UpdateUsedMemory(tag, size);
+		if (memory_usage_probe_count.load() == 0) {
+			return;
+		}
+
+		// A first observer registered concurrently. Give it an absolute post-update value.
+		lock_guard<mutex> guard(memory_usage_probes_lock);
+		auto bytes = memory_usage.GetUsedMemory(tag, MemoryUsageCaches::FLUSH);
+		for (auto entry = memory_usage_probes.begin(); entry != memory_usage_probes.end();) {
+			auto probe = entry->lock();
+			if (!probe) {
+				entry = memory_usage_probes.erase(entry);
+				continue;
+			}
+
+			probe->BufferPoolSnapshot(tag, bytes);
+			entry++;
+		}
+		memory_usage_probe_count.store(memory_usage_probes.size());
+		return;
+	}
+
+	lock_guard<mutex> guard(memory_usage_probes_lock);
 	memory_usage.UpdateUsedMemory(tag, size);
+	for (auto entry = memory_usage_probes.begin(); entry != memory_usage_probes.end();) {
+		auto probe = entry->lock();
+		if (!probe) {
+			entry = memory_usage_probes.erase(entry);
+			continue;
+		}
+
+		probe->BufferPoolDelta(tag, size);
+		entry++;
+	}
+	memory_usage_probe_count.store(memory_usage_probes.size());
+}
+
+void BufferPool::RegisterMemoryUsageProbe(const shared_ptr<MemoryUsageProbe> &probe) {
+	if (!probe) {
+		return;
+	}
+
+	lock_guard<mutex> guard(memory_usage_probes_lock);
+	memory_usage_probes.emplace_back(probe);
+	memory_usage_probe_count.store(memory_usage_probes.size());
+	for (idx_t tag_index = 0; tag_index < MEMORY_TAG_COUNT; tag_index++) {
+		auto tag = MemoryTag(tag_index);
+		auto bytes = memory_usage.GetUsedMemory(tag, MemoryUsageCaches::FLUSH);
+		probe->BufferPoolSnapshot(tag, bytes);
+	}
+	probe->BufferPoolLimit(maximum_memory);
 }
 
 idx_t BufferPool::GetUsedMemory(bool flush) const {
@@ -539,6 +594,22 @@ void BufferPool::SetLimit(idx_t limit, const char *exception_postscript) {
 		    exception_postscript);
 	}
 	block_allocator.FlushAll();
+	if (memory_usage_probe_count.load() == 0) {
+		return;
+	}
+
+	lock_guard<mutex> guard(memory_usage_probes_lock);
+	for (auto entry = memory_usage_probes.begin(); entry != memory_usage_probes.end();) {
+		auto probe = entry->lock();
+		if (!probe) {
+			entry = memory_usage_probes.erase(entry);
+			continue;
+		}
+
+		probe->BufferPoolLimit(limit);
+		entry++;
+	}
+	memory_usage_probe_count.store(memory_usage_probes.size());
 }
 
 void BufferPool::SetAllocatorBulkDeallocationFlushThreshold(idx_t threshold) {

@@ -1,0 +1,124 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Backing structures for generated instrumentation libraries.
+//!
+//! Instrumented application code should not import this crate directly unless
+//! there is a very special reason. Instead, it should interact with the
+//! generated instrumentation library only.
+
+#[cfg(feature = "io-collector")]
+#[doc(hidden)]
+pub mod collector;
+mod context;
+mod entity;
+mod fsm_handle;
+mod handle;
+mod model;
+mod noop;
+#[cfg(not(target_arch = "wasm32"))]
+mod observer;
+#[cfg(target_arch = "wasm32")]
+#[path = "observer_wasm.rs"]
+mod observer;
+mod sidecar;
+
+#[cfg(feature = "io-collector")]
+#[doc(hidden)]
+pub use collector::{CollectorRouter, CollectorSink, deserialize_event, serialize_event};
+pub use context::ContextInner;
+pub use entity::{InstrumentedEntity, Observer};
+pub use fsm_handle::{FsmEvent, FsmHandleInner};
+pub use handle::{HandleError, HandleInner};
+pub use model::{Context, InstrumentedModel, ObserverBuilder, ObserverProvider};
+pub use noop::Noop;
+pub use observer::{EventSender, ObserverInner};
+pub use sidecar::{ContextExporter, write_sidecar};
+
+// Re-export everything the generated instrumentation code references, so a
+// consumer needs only the `quent-instrumentation` dependency, selecting an
+// exporter backend through its `io-*` features.
+pub use quent_build_info as build_info;
+pub use quent_dynamic_attributes::{
+    DynamicAttribute, DynamicAttributes, DynamicList, DynamicNull, DynamicStruct, DynamicValue,
+};
+#[doc(hidden)]
+pub use quent_events as events;
+pub use quent_events::{AnyEntity, EntityEvent, EntityRef, Event, Model, ModelEvents};
+pub use quent_io::{ExporterOptions, ExporterProvider};
+#[cfg(any(feature = "io-ndjson", feature = "io-msgpack", feature = "io-postcard"))]
+pub use quent_io::{FileSystemExporterOptions, FileSystemFormat};
+pub use uuid::Uuid;
+
+/// A caller-supplied typed event sink, selected via the `io-callback` feature.
+#[cfg(feature = "io-callback")]
+pub use quent_io_callback::EventCallback;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quent_build_info::ModelSource;
+    use quent_events::{EntityEvent, Event};
+    use quent_io::{ExporterOptions, FileSystemExporterOptions, FileSystemFormat};
+    use uuid::Uuid;
+
+    struct TestModel;
+
+    impl ModelSource for TestModel {
+        fn package() -> &'static str {
+            "quent-instrumentation"
+        }
+        fn source() -> quent_build_info::BuildInfo {
+            quent_build_info::BuildInfo::unknown()
+        }
+    }
+
+    #[derive(Debug, serde::Serialize)]
+    struct TestEvent;
+
+    impl EntityEvent for TestEvent {
+        const NAME: &'static str = "TestEvent";
+    }
+
+    impl Model for TestModel {
+        const NAME: &'static str = "Test";
+    }
+
+    #[test]
+    fn e2e_filesystem_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Uuid::now_v7();
+        let ctx = ContextInner::try_new(id).unwrap();
+        let options = ExporterOptions::FileSystem(FileSystemExporterOptions::new(
+            FileSystemFormat::Ndjson,
+            dir.path().to_path_buf(),
+        ));
+        write_sidecar(&options, id, TestModel::model_info());
+
+        let context_dir = dir.path().join(id.to_string());
+
+        {
+            let observer = ctx
+                .block_on(async { ctx.observer::<TestEvent>(&options).await })
+                .unwrap();
+            observer.send(Event::new_now(Uuid::now_v7(), TestEvent));
+            // Drop the observer to drain and flush before asserting.
+        }
+
+        assert!(
+            context_dir.join("model.qmi").is_file(),
+            "sidecar should sit in the context directory"
+        );
+        let ndjson_files: Vec<_> = std::fs::read_dir(context_dir.join("TestEvent"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("ndjson"))
+            .collect();
+        assert_eq!(
+            ndjson_files.len(),
+            1,
+            "one UUID-named ndjson batch file in the entity subdirectory"
+        );
+    }
+}

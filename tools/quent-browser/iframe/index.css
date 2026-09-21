@@ -1,0 +1,10 @@
+@import '../.quent/ui/src/index.css';
+@source '../.quent/ui/src/**/*.{ts,tsx}';
+@source '../.quent/ui/packages/@quent/**/*.{ts,tsx}';
+
+html,
+body,
+#root {
+	height: 100%;
+	margin: 0;
+}

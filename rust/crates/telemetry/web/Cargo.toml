@@ -1,0 +1,33 @@
+[package]
+name = "duckdb-telemetry-web"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["wasm"]
+wasm = ["dep:wasm-bindgen"]
+native-fixture = ["duckdb-telemetry-store/native-io", "dep:quent-store"]
+
+[[example]]
+name = "convert_capture"
+required-features = ["native-fixture"]
+
+[dependencies]
+duckdb-telemetry-analyzer = { path = "../analyzer", default-features = false }
+duckdb-telemetry-store = { path = "../store", default-features = false }
+postcard = { version = "1", features = ["alloc"] }
+quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", features = ["serde"] }
+quent-query-engine-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+quent-store = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", features = ["io-msgpack"], optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["js", "serde"] }
+wasm-bindgen = { version = "0.2", optional = true }
+
+[build-dependencies]
+sha2 = "0.10"

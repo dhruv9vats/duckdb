@@ -1,6 +1,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/common/arrow/arrow_type_extension.hpp"
 #include "duckdb/main/profiler/metrics_manager.hpp"
+#include "duckdb/main/telemetry_context.hpp"
 #include "duckdb/parser/peg/compiled_grammar.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -294,6 +295,26 @@ static duckdb_ext_api_v1 CreateAPIv1Wrapper() {
 	return CreateAPIv1();
 }
 
+BrowserTelemetryBatch DatabaseInstance::DrainBrowserEvents(uint64_t max_bytes) {
+	return telemetry_context->DrainBrowserEvents(max_bytes);
+}
+
+vector<string> DatabaseInstance::BrowserTelemetryQueryIds() {
+	return telemetry_context->BrowserTelemetryQueryIds();
+}
+
+string DatabaseInstance::BrowserTelemetryContextId() {
+	return telemetry_context->BrowserTelemetryContextId();
+}
+
+uint64_t DatabaseInstance::BrowserTelemetryWatermark() {
+	return telemetry_context->BrowserTelemetryWatermark();
+}
+
+bool DatabaseInstance::BeginBrowserTelemetryRun() {
+	return telemetry_context->BeginBrowserTelemetryRun();
+}
+
 void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_config) {
 	DBConfig default_config;
 	DBConfig *config_ptr = &default_config;
@@ -302,6 +323,7 @@ void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_conf
 	}
 
 	Configure(*config_ptr, database_path);
+	telemetry_context = make_uniq<TelemetryContext>(config);
 	// publish what this binary links, unless the config already carries a set handed to us
 	ExtensionHelper::RegisterLinkedExtensions(config);
 
@@ -315,7 +337,9 @@ void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_conf
 	if (config.buffer_manager) {
 		buffer_manager = config.buffer_manager;
 	} else {
-		buffer_manager = make_uniq<StandardBufferManager>(*this, config.options.temporary_directory);
+		buffer_manager =
+		    make_uniq<StandardBufferManager>(*this, config.options.temporary_directory,
+		                                     telemetry_context->TempIoProbe(), telemetry_context->MemoryUsageProbe());
 	}
 
 	log_manager = make_uniq<LogManager>(*this, LogConfig());

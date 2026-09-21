@@ -13,6 +13,7 @@
 #include "duckdb/logging/log_type.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/telemetry_context.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include "duckdb/parallel/pipeline_event.hpp"
 #include "duckdb/parallel/pipeline_executor.hpp"
@@ -34,6 +35,11 @@ PipelineTask::PipelineTask(Pipeline &pipeline_p, shared_ptr<Event> event_p)
 		// Account for every task before lazy executor construction can advance the batch minimum.
 		reserved_batch_index = pipeline.RegisterNewBatchIndex();
 	}
+	TelemetryContext::PipelineTaskCreated(pipeline.GetClientContext(), *this, pipeline);
+}
+
+PipelineTask::~PipelineTask() {
+	TelemetryContext::PipelineTaskFinished(pipeline.GetClientContext(), *this, TelemetryTaskOutcome::FAILURE);
 }
 
 bool PipelineTask::TaskBlockedOnResult() const {
@@ -45,8 +51,10 @@ const PipelineExecutor &PipelineTask::GetPipelineExecutor() const {
 }
 
 TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
+	TelemetryContext::PipelineTaskRunning(pipeline.GetClientContext(), *this, mode);
 	if (!pipeline_executor) {
 		pipeline_executor = make_uniq<PipelineExecutor>(pipeline.GetClientContext(), pipeline, reserved_batch_index);
+		TelemetryContext::PipelineTaskExecutor(pipeline.GetClientContext(), *this, *pipeline_executor);
 	}
 
 	pipeline_executor->SetTaskForInterrupts(shared_from_this());
@@ -56,8 +64,10 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 
 		switch (res) {
 		case PipelineExecuteResult::NOT_FINISHED:
+			TelemetryContext::PipelineTaskReady(pipeline.GetClientContext(), *this);
 			return TaskExecutionResult::TASK_NOT_FINISHED;
 		case PipelineExecuteResult::INTERRUPTED:
+			TelemetryContext::PipelineTaskBlocked(pipeline.GetClientContext(), *this);
 			return TaskExecutionResult::TASK_BLOCKED;
 		case PipelineExecuteResult::FINISHED:
 			break;
@@ -68,6 +78,7 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 		case PipelineExecuteResult::NOT_FINISHED:
 			throw InternalException("Execute without limit should not return NOT_FINISHED");
 		case PipelineExecuteResult::INTERRUPTED:
+			TelemetryContext::PipelineTaskBlocked(pipeline.GetClientContext(), *this);
 			return TaskExecutionResult::TASK_BLOCKED;
 		case PipelineExecuteResult::FINISHED:
 			break;
@@ -75,6 +86,7 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 	}
 
 	event->FinishTask();
+	TelemetryContext::PipelineTaskFinished(pipeline.GetClientContext(), *this, TelemetryTaskOutcome::SUCCESS);
 	pipeline_executor.reset();
 	return TaskExecutionResult::TASK_FINISHED;
 }

@@ -1,0 +1,24 @@
+[package]
+name = "duckdb-telemetry-model"
+version.workspace = true
+edition.workspace = true
+
+[features]
+collector = ["quent-instrumentation/io-collector"]
+browser = ["quent-instrumentation/io-callback"]
+
+[dependencies]
+quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", features = ["serde"] }
+quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", default-features = false }
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["serde", "v7"] }
+
+[build-dependencies]
+quent-build-info = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+quent-instrumentation-build = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+
+[dev-dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", features = ["clap"] }
+uuid = { version = "1", features = ["macro-diagnostics"] }

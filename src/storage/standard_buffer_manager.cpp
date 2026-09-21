@@ -70,7 +70,19 @@ void StandardBufferManager::SetTemporaryDirectory(const string &new_dir) {
 }
 
 StandardBufferManager::StandardBufferManager(DatabaseInstance &db, string tmp)
-    : BufferManager(), db(db), buffer_pool(db.GetBufferPool()), temporary_id(MAXIMUM_BLOCK),
+    : StandardBufferManager(db, std::move(tmp), nullptr, nullptr) {
+}
+
+StandardBufferManager::StandardBufferManager(DatabaseInstance &db, string tmp,
+                                             shared_ptr<TemporaryIoProbe> temporary_io_probe_p)
+    : StandardBufferManager(db, std::move(tmp), std::move(temporary_io_probe_p), nullptr) {
+}
+
+StandardBufferManager::StandardBufferManager(DatabaseInstance &db, string tmp,
+                                             shared_ptr<TemporaryIoProbe> temporary_io_probe_p,
+                                             shared_ptr<MemoryUsageProbe> memory_usage_probe_p)
+    : BufferManager(), db(db), buffer_pool(db.GetBufferPool()), temporary_io_probe(std::move(temporary_io_probe_p)),
+      memory_usage_probe(std::move(memory_usage_probe_p)), temporary_id(MAXIMUM_BLOCK),
       buffer_allocator(BufferAllocatorAllocate, BufferAllocatorFree, BufferAllocatorRealloc,
                        make_uniq<BufferAllocatorData>(*this)) {
 	temp_block_manager =
@@ -79,9 +91,42 @@ StandardBufferManager::StandardBufferManager(DatabaseInstance &db, string tmp)
 	for (idx_t i = 0; i < MEMORY_TAG_COUNT; i++) {
 		evicted_data_per_tag[i] = 0;
 	}
+	buffer_pool.RegisterMemoryUsageProbe(memory_usage_probe);
+}
+
+unique_ptr<TemporaryIoEvent> StandardBufferManager::StartTempIo(QueryContext context, TemporaryIoDirection direction,
+                                                                block_id_t block_id, MemoryTag tag,
+                                                                idx_t buffer_bytes) {
+	if (!temporary_io_probe) {
+		return nullptr;
+	}
+
+	try {
+		return temporary_io_probe->Start(
+		    {context, direction, NumericCast<uint64_t>(block_id), tag, NumericCast<uint64_t>(buffer_bytes)});
+	} catch (...) {
+		return nullptr;
+	}
 }
 
 StandardBufferManager::~StandardBufferManager() {
+}
+
+void StandardBufferManager::UpdateTemporaryStorage(MemoryTag tag, int64_t bytes) {
+	unique_lock<mutex> probe_guard(memory_usage_probe_lock, std::defer_lock);
+	if (memory_usage_probe) {
+		probe_guard.lock();
+	}
+
+	auto &evicted_data = evicted_data_per_tag[uint8_t(tag)];
+	if (bytes < 0) {
+		evicted_data -= NumericCast<idx_t>(-bytes);
+	} else {
+		evicted_data += NumericCast<idx_t>(bytes);
+	}
+	if (memory_usage_probe) {
+		memory_usage_probe->TemporaryStorageDelta(tag, bytes);
+	}
 }
 
 BufferPool &StandardBufferManager::GetBufferPool() const {
@@ -461,6 +506,9 @@ void StandardBufferManager::SetSwapLimit(optional_idx limit) {
 		temporary_directory.handle->GetTempFile().SetMaxSwapSpace(limit);
 	} else {
 		temporary_directory.maximum_swap_space = limit;
+		if (memory_usage_probe) {
+			memory_usage_probe->TemporaryStorageLimit(limit);
+		}
 	}
 }
 
@@ -490,8 +538,9 @@ void StandardBufferManager::RequireTemporaryDirectory() {
 	lock_guard<mutex> guard(temporary_directory.lock);
 	if (!temporary_directory.handle) {
 		// temp directory has not been created yet: initialize it
-		temporary_directory.handle = make_uniq<TemporaryDirectoryHandle>(
-		    db, temporary_directory.path, temporary_directory.size_on_disk, temporary_directory.maximum_swap_space);
+		temporary_directory.handle =
+		    make_uniq<TemporaryDirectoryHandle>(db, temporary_directory.path, temporary_directory.size_on_disk,
+		                                        temporary_directory.maximum_swap_space, memory_usage_probe);
 	}
 }
 
@@ -501,13 +550,18 @@ bool StandardBufferManager::EncryptTemporaryFiles() {
 
 void StandardBufferManager::WriteTemporaryBuffer(QueryContext context, MemoryTag tag, block_id_t block_id,
                                                  FileBuffer &buffer) {
+	auto telemetry = StartTempIo(context, TemporaryIoDirection::SPILL, block_id, tag, buffer.AllocSize());
+
 	// WriteTemporaryBuffer assumes that we never write a buffer below DEFAULT_BLOCK_ALLOC_SIZE.
 	RequireTemporaryDirectory();
 
 	// Append to a few grouped files.
 	if (buffer.AllocSize() == GetBlockAllocSize()) {
 		idx_t eviction_size = temporary_directory.handle->GetTempFile().WriteTemporaryBuffer(context, block_id, buffer);
-		evicted_data_per_tag[uint8_t(tag)] += eviction_size;
+		UpdateTemporaryStorage(tag, NumericCast<int64_t>(eviction_size));
+		if (telemetry) {
+			telemetry->Complete(eviction_size);
+		}
 		return;
 	}
 
@@ -519,8 +573,6 @@ void StandardBufferManager::WriteTemporaryBuffer(QueryContext context, MemoryTag
 	if (EncryptTemporaryFiles()) {
 		header_size += DEFAULT_ENCRYPTED_BUFFER_HEADER_SIZE;
 	}
-
-	evicted_data_per_tag[uint8_t(tag)] += buffer.AllocSize();
 
 	// Create the file and write the size followed by the buffer contents.
 	auto &fs = FileSystem::GetFileSystem(db);
@@ -543,6 +595,10 @@ void StandardBufferManager::WriteTemporaryBuffer(QueryContext context, MemoryTag
 	}
 
 	buffer.Write(context, *handle, offset);
+	UpdateTemporaryStorage(tag, NumericCast<int64_t>(buffer.AllocSize()));
+	if (telemetry) {
+		telemetry->Complete(buffer.AllocSize() + header_size);
+	}
 }
 
 unique_ptr<FileBuffer> StandardBufferManager::ReadTemporaryBuffer(QueryContext context, MemoryTag tag,
@@ -550,6 +606,7 @@ unique_ptr<FileBuffer> StandardBufferManager::ReadTemporaryBuffer(QueryContext c
                                                                   unique_ptr<FileBuffer> reusable_buffer) {
 	D_ASSERT(!temporary_directory.path.empty());
 	auto id = block.BlockId();
+	auto telemetry = StartTempIo(context, TemporaryIoDirection::RELOAD, id, tag, block.GetMemory().GetMemoryUsage());
 	if (!temporary_directory.handle) {
 		throw InternalException("ReadTemporaryBuffer called but temporary directory has not been instantiated yet");
 	}
@@ -561,8 +618,11 @@ unique_ptr<FileBuffer> StandardBufferManager::ReadTemporaryBuffer(QueryContext c
 		    context, id, std::move(reusable_buffer), &eviction_size);
 
 		// Decrement evicted size.
-		evicted_data_per_tag[uint8_t(tag)] -= eviction_size;
+		UpdateTemporaryStorage(tag, -NumericCast<int64_t>(eviction_size));
 
+		if (telemetry) {
+			telemetry->Complete(eviction_size);
+		}
 		return buffer;
 	}
 
@@ -572,6 +632,7 @@ unique_ptr<FileBuffer> StandardBufferManager::ReadTemporaryBuffer(QueryContext c
 	auto path = GetTemporaryPath(id);
 	auto &fs = FileSystem::GetFileSystem(db);
 	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+	auto storage_bytes = handle->GetFileSize();
 	handle->Read(context, &block_size, sizeof(idx_t), 0);
 	handle->Read(context, &block_header_size, sizeof(idx_t), sizeof(idx_t));
 
@@ -602,6 +663,9 @@ unique_ptr<FileBuffer> StandardBufferManager::ReadTemporaryBuffer(QueryContext c
 	// decrement again here or the counter underflows on every read-back.
 	DeleteTemporaryFile(block.GetMemory());
 
+	if (telemetry) {
+		telemetry->Complete(storage_bytes);
+	}
 	return buffer;
 }
 
@@ -625,7 +689,7 @@ void StandardBufferManager::DeleteTemporaryFile(BlockMemory &memory) {
 	// check if we should delete the file from the shared pool of files, or from the general file system
 	if (temporary_directory.handle->GetTempFile().HasTemporaryBuffer(id)) {
 		idx_t eviction_size = temporary_directory.handle->GetTempFile().DeleteTemporaryBuffer(id);
-		evicted_data_per_tag[uint8_t(memory.GetMemoryTag())] -= eviction_size;
+		UpdateTemporaryStorage(memory.GetMemoryTag(), -NumericCast<int64_t>(eviction_size));
 		return;
 	}
 
@@ -633,7 +697,7 @@ void StandardBufferManager::DeleteTemporaryFile(BlockMemory &memory) {
 	auto &fs = FileSystem::GetFileSystem(db);
 	auto path = GetTemporaryPath(id);
 	if (fs.FileExists(path)) {
-		evicted_data_per_tag[uint8_t(memory.GetMemoryTag())] -= memory.GetMemoryUsage();
+		UpdateTemporaryStorage(memory.GetMemoryTag(), -NumericCast<int64_t>(memory.GetMemoryUsage()));
 		auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
 		auto content_size = handle->GetFileSize();
 		handle.reset();
@@ -727,7 +791,7 @@ void StandardBufferManager::FreeReservedMemory(idx_t size) {
 	if (size == 0) {
 		return;
 	}
-	buffer_pool.memory_usage.UpdateUsedMemory(MemoryTag::EXTENSION, -(int64_t)size);
+	buffer_pool.UpdateUsedMemory(MemoryTag::EXTENSION, -NumericCast<int64_t>(size));
 }
 
 //===--------------------------------------------------------------------===//
