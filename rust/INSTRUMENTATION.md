@@ -3,6 +3,8 @@
 This document explains what the DuckDB telemetry entities mean, where their
 events come from, what the analyzer can conclude, and what it must not claim.
 See [README.md](README.md) for build, capture, server, and UI commands.
+See [INSTRUMENTATION_CANDIDATES.md](INSTRUMENTATION_CANDIDATES.md) for proposed
+coverage, evidence, hook sites, cost, and priority.
 
 ## System map
 
@@ -42,25 +44,26 @@ several executions.
 ### Event path
 
 ```text
-Rust model declarations
-        ↓ bridge/build.rs
-Generated CXX observers and handles
-        ↓
-DuckDB lifecycle hooks
-        ↓ exporter
-Quent event stream
-        ↓
+model/model.yaml
+   ├─ instrumentation codegen → Rust emitters
+   ├─ store codegen           → serialized event types
+   └─ C++ codegen             → typed observers and handles
+                                      ↓
+DuckDB lifecycle hooks → exporter → event stream
+                                      ↓
 DuckDB analyzer reconstruction and validation
-        ↓
-Quent query bundle, entity, timeline, and dataflow APIs
-        ↓
-Quent UI
+                                      ↓
+Query bundle, entity, timeline, and data-flow APIs → Quent UI
 ```
 
-The Rust model is the schema. Generated bridge types prevent C++ from emitting
-attributes or transitions that are absent from that schema. The analyzer is a
-separate semantic boundary: it validates cross-entity references, filters
-incomplete data, derives timelines, and prepares UI-specific structures.
+The YAML file is the only schema definition. Build scripts independently
+derive emitters, stored events, and the C++ facade from it. The store crate
+defines transition adapters used by Quent's analyzers. Generated C++ typestate
+handles make invalid transitions unrepresentable at call sites.
+
+The DuckDB analyzer remains a semantic boundary. It validates cross-entity
+references, excludes incomplete data, derives timelines, and prepares
+UI-specific structures.
 
 ## Structural entities
 
@@ -103,6 +106,8 @@ Init → Planning → Executing → Exit
 DuckDB records the SQL text as the query instance name. A query handle is
 created only when an executable physical plan is available. The telemetry then
 emits Planning, declares the plan, enters Executing, and exits at query end.
+`Planning` therefore measures telemetry plan emission, not DuckDB parse, bind,
+optimization, or physical-planning latency.
 
 This delayed creation is intentional. The standard Quent FSM cannot exit from
 Planning, so emitting a binder or planner failure as `Planning → Exit` would be
@@ -333,8 +338,9 @@ the active operator invocation on the current thread.
 - A spill is attributed to the work that caused memory pressure.
 - The evicted block may belong to another operator or query.
 
-The field is therefore `trigger_operator_id`, not `owner_operator_id`. Nil task
-or operator IDs are valid when I/O happens outside an instrumented invocation.
+The field is therefore `trigger_operator_id`, not `owner_operator_id`. Task and
+operator references are typed options. Absence is valid when I/O happens
+outside an instrumented task or invocation; no nil-ID sentinel is emitted.
 
 #### Interpretation
 
@@ -371,10 +377,17 @@ The analyzer clips their database-wide spans to the selected query window.
 Selecting any physical operator therefore removes these series. This avoids
 inventing ownership that DuckDB does not track.
 
-Memory accounts are timeline-only. They start before query-relative time zero,
-which the current UI entity-list conversion cannot represent as a finite FSM.
-The analyzer still uses them for untyped totals and `memory_account` series
-split by `MemoryTag`.
+Memory accounts appear in entity lists as query-clipped summaries. Each row has
+at most three transitions: registration, the first accounted state, and exit.
+The accounted transition keeps the memory-resource ID and the registration
+keeps the tag. When an account has several updates, row capacity values are
+omitted rather than presenting the first value as if it covered the full span.
+The derived attributes `accounted_updates_total` and
+`accounted_updates_omitted` make this summarization explicit.
+
+This compaction applies only to entity-row serialization. Ranking and memory
+timelines use every native `Accounted` transition, so totals and tag series
+remain exact.
 
 ## Resources
 
@@ -412,6 +425,8 @@ It is an approximation of runnable backlog, not an exact scheduler queue:
 
 Use it to diagnose dispatch delay and runnable pressure. Do not interpret it as
 an exact count of nodes inside DuckDB's internal queue at every instant.
+DuckDB does not expose a matching configured queue capacity, so the resource's
+`entries` bound is unknown.
 
 ### TemporaryIoChannel
 
@@ -421,13 +436,14 @@ active. The worker owns two instances:
 - `temporary-spill` for RAM-to-temporary-storage service;
 - `temporary-reload` for temporary-storage-to-RAM service.
 
-Each usage contributes:
+Each active operation contributes:
 
-- `capacity_operations = 1`;
-- `capacity_buffer_bytes = aligned in-memory buffer bytes`.
+- one operation;
+- its aligned in-memory buffer bytes.
 
 The analyzer reports operations per second and buffer bytes per second. These
 are effective buffer-manager service rates, not fixed hardware capacity.
+Neither dimension has a known configured bound.
 
 This is intentionally a channel rather than a memory tier. The current events
 observe the transfer arrows, not the interval during which a block resides in
@@ -558,18 +574,18 @@ Before an entity affects UI output, the analyzer validates relevant joins:
 - one stable Engine-parent memory resource per account;
 - terminal FSM completion.
 
-Invalid or incomplete runtime entities remain importable but are excluded from
-query-scoped lists and timelines.
+Incomplete query and application FSMs are omitted from immutable analysis and
+logged at debug level. Invalid completed FSMs fail analysis.
 
-### Live snapshots
+### Incomplete captures
 
-Engine, worker, and runtime resources may still be operating when the UI opens.
-The analyzer creates analysis-only terminal events at the latest observed
-timestamp. It never writes synthetic events back to the capture. Real terminal
-events remain authoritative.
+The analyzer does not invent missing FSM transitions. A missing exit remains
+unobserved behavior. Engine and worker responses remain open: `duration_s` or
+`end_unix_ns` is absent. Incomplete query and application FSMs are omitted.
 
-This permits completed queries to be inspected before the DuckDB process exits
-and avoids the earlier "engine does not have an exit timestamp" failure.
+A runtime resource is omitted if it never reached `Operating`. An operating
+resource remains present and open without a fabricated exit. Capture after
+DuckDB exits when closed database-wide lifetimes matter.
 
 ### Query bundle
 
@@ -593,12 +609,14 @@ initializing Quent UI selector without accepting unknown named types.
 - `pipeline_task`;
 - `operator_invocation`;
 - `chunk_transfer`;
-- `temporary_block_io`.
+- `temporary_block_io`;
+- `memory_account`.
 
 Operator filters use pipeline containment for tasks, exact operator identity
 for invocations, and causal trigger identity for temporary I/O.
-`memory_account` is intentionally timeline-only because its Engine lifetime
-starts before every query epoch.
+Memory-account rows are clipped to the query span and summarized as described
+above. Operator selection excludes them because DuckDB does not track
+operator ownership for database-wide accounts.
 
 ### Resource timelines
 

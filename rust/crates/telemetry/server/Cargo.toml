@@ -12,9 +12,16 @@ axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 duckdb-telemetry-analyzer = { path = "../analyzer" }
 duckdb-telemetry-model = { path = "../model", features = ["collector"] }
-quent-collector = { git = "https://github.com/rapidsai/quent.git", rev = "a872bf1a113c6509ccb4347fc98b067bd6c1829f" }
-quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "a872bf1a113c6509ccb4347fc98b067bd6c1829f" }
-quent-query-engine-server = { git = "https://github.com/rapidsai/quent.git", rev = "a872bf1a113c6509ccb4347fc98b067bd6c1829f" }
+duckdb-telemetry-store = { path = "../store" }
+quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+quent-collector = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+quent-query-engine-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+quent-query-engine-server = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+quent-store = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", features = ["io-msgpack", "io-ndjson", "io-postcard"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 tracing = "0.1"
 uuid = "1"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

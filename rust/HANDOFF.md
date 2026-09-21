@@ -1,5 +1,10 @@
 # DuckDB Quent telemetry handoff
 
+> Agent-only historical record. It predates the YAML migration and contains
+> obsolete crate, revision, and generated-API details. Use
+> [AGENT_CONTEXT.md](AGENT_CONTEXT.md) for the current architecture. Human
+> documentation starts at [README.md](README.md).
+
 Updated: 2026-08-25
 
 This is the self-contained handoff for the DuckDB Quent work. It records the

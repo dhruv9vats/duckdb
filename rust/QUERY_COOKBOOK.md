@@ -9,7 +9,7 @@ views. Run commands from the repository root. See
 Build DuckDB with telemetry enabled:
 
 ```bash
-cd /home/dvats/repos/duckdb
+cd /path/to/duckdb
 cmake -S . -B build/release \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_QUENT_TELEMETRY=ON
@@ -20,7 +20,7 @@ The examples use `build/release/duckdb`. Override it before running a workload
 if the telemetry-enabled shell lives elsewhere:
 
 ```bash
-export DUCKDB_BIN=/home/dvats/repos/duckdb/build/release/duckdb
+export DUCKDB_BIN=build/release/duckdb
 ```
 
 ## Start the analyzer after a capture
@@ -29,7 +29,7 @@ Every workload below assigns its capture directory to `events_dir`. After the
 DuckDB command exits, run this in the same shell:
 
 ```bash
-cd /home/dvats/repos/duckdb
+cd /path/to/duckdb
 cargo run --manifest-path rust/Cargo.toml \
     -p duckdb-telemetry-server --features ui -- \
     --output-dir "$events_dir" \
@@ -74,7 +74,7 @@ joins, blocking aggregation, two windows, ordering, chunk flow, and forced
 spill/reload in one target query.
 
 ```bash
-cd /home/dvats/repos/duckdb
+cd /path/to/duckdb
 DUCKDB_BIN=${DUCKDB_BIN:-build/release/duckdb}
 run_dir=$(mktemp -d /tmp/duckdb-quent-combined.XXXXXX)
 events_dir="$run_dir/events"
@@ -190,7 +190,7 @@ The target reads stored tables because DuckDB's `range()` table function is
 forced single-threaded.
 
 ```bash
-cd /home/dvats/repos/duckdb
+cd /path/to/duckdb
 DUCKDB_BIN=${DUCKDB_BIN:-build/release/duckdb}
 events_dir=$(mktemp -d /tmp/duckdb-quent-parallel.XXXXXX)
 
@@ -249,7 +249,7 @@ Purpose:
 for ordinary performance measurements.
 
 ```bash
-cd /home/dvats/repos/duckdb
+cd /path/to/duckdb
 DUCKDB_BIN=${DUCKDB_BIN:-build/release/duckdb}
 events_dir=$(mktemp -d /tmp/duckdb-quent-spill.XXXXXX)
 spill_dir=$(mktemp -d /tmp/duckdb-spill.XXXXXX)
@@ -317,7 +317,7 @@ Purpose:
 The DuckDB command is expected to report a conversion error.
 
 ```bash
-cd /home/dvats/repos/duckdb
+cd /path/to/duckdb
 DUCKDB_BIN=${DUCKDB_BIN:-build/release/duckdb}
 events_dir=$(mktemp -d /tmp/duckdb-quent-failure.XXXXXX)
 
@@ -375,7 +375,7 @@ Purpose:
 - task and chunk-flow timelines without intentionally forcing spill.
 
 ```bash
-cd /home/dvats/repos/duckdb
+cd /path/to/duckdb
 DUCKDB_BIN=${DUCKDB_BIN:-build/release/duckdb}
 tpch_root=${TPCH_ROOT:-/data/tpch/sf10/p16/snappy}
 events_dir=$(mktemp -d /tmp/duckdb-quent-tpch-q1.XXXXXX)
@@ -424,7 +424,7 @@ Purpose:
 - a nontrivial plan dataflow overlay.
 
 ```bash
-cd /home/dvats/repos/duckdb
+cd /path/to/duckdb
 DUCKDB_BIN=${DUCKDB_BIN:-build/release/duckdb}
 tpch_root=${TPCH_ROOT:-/data/tpch/sf10/p16/snappy}
 events_dir=$(mktemp -d /tmp/duckdb-quent-tpch-q9.XXXXXX)
@@ -516,23 +516,23 @@ work may be short because the aggregate has low cardinality.
 
 ## TPC-H workload 3: all runtime entities
 
-This validated SF1 workload combines a partitioned scan, join, blocking
-aggregation, two windows, and forced external execution. It is the TPC-H
-alternative to the recommended generated workload.
+This migration-validation workload combines a partitioned scan, join, blocking
+aggregation, two windows, and forced external execution. Msgpack limits capture
+size and import overhead.
 
 ```bash
-cd /home/dvats/repos/duckdb
+cd /path/to/duckdb
 DUCKDB_BIN=${DUCKDB_BIN:-build/release/duckdb}
-tpch_root=${TPCH_ROOT:-/data/tpch/sf1/p16/snappy}
+tpch_root=${TPCH_ROOT:-/data/tpch/sf10/p16/snappy}
 events_dir=$(mktemp -d /tmp/duckdb-quent-tpch-all.XXXXXX)
 spill_dir=$(mktemp -d /tmp/duckdb-tpch-all-spill.XXXXXX)
 
-QUENT_EXPORTER=ndjson \
+QUENT_EXPORTER=msgpack \
 QUENT_OUTPUT_DIR="$events_dir" \
 "$DUCKDB_BIN" -c "
 SET threads=4;
 SET scheduler_process_partial=true;
-SET memory_limit='128MB';
+SET memory_limit='512MB';
 SET temp_directory='$spill_dir';
 SET preserve_insertion_order=false;
 SET debug_force_external=true;
@@ -575,10 +575,12 @@ echo "Quent events: $events_dir"
 echo "DuckDB spill directory: $spill_dir"
 ```
 
-One validated capture produced 689 temporary-I/O entities: 379 spills and 310
-reloads. Select the final `WITH revenue AS ...` query. Inspect `READ_PARQUET`,
+Select the final `WITH revenue AS ...` query. Inspect `READ_PARQUET`,
 `HASH_JOIN`, `HASH_GROUP_BY`, and `WINDOW`, then compare them with the spill and
-reload resources. Counts vary by build and scheduling.
+reload resources. A pre-migration SF10 capture contained 33 tasks, 140,718
+chunk publications, 215,988 operator invocations, and 28,742 temporary-I/O
+operations. Treat these as regression context; counts vary by build and
+scheduling.
 
 ## Event-volume guidance
 

@@ -10,9 +10,11 @@ crate-type = ["staticlib"]
 [dependencies]
 cxx.workspace = true
 duckdb-telemetry-model = { path = "../model" }
+quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", features = ["io-collector", "io-msgpack", "io-ndjson", "io-postcard"] }
+quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", features = ["collector", "msgpack", "ndjson", "postcard"] }
 
 [build-dependencies]
 cxx-build.workspace = true
-duckdb-telemetry-model = { path = "../model" }
-quent-codegen = { git = "https://github.com/rapidsai/quent.git", rev = "a872bf1a113c6509ccb4347fc98b067bd6c1829f" }
-
+quent-schema-codegen-cpp = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }

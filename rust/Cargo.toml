@@ -5,6 +5,7 @@ members = [
     "crates/telemetry/bridge",
     "crates/telemetry/model",
     "crates/telemetry/server",
+    "crates/telemetry/store",
 ]
 
 [workspace.package]
@@ -16,4 +17,3 @@ edition = "2024"
 # workspace lockfile resolve them together.
 cxx = "1"
 cxx-build = "1"
-

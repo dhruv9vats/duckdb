@@ -1,16 +1,27 @@
 use std::{net::ToSocketAddrs, path::PathBuf};
 
 use clap::Parser;
-use duckdb_telemetry_analyzer::DuckDbUiAnalyzer;
-use duckdb_telemetry_model::{DuckDB, DuckDBContext};
+use duckdb_telemetry_analyzer::{DuckDbUiAnalyzer, Viewer};
+use duckdb_telemetry_model as instrumentation;
+use duckdb_telemetry_store::DuckDb;
+use quent_analyzer::context::index_contexts;
 use quent_io::ExporterOptions;
 use quent_io::filesystem::{self, Format};
+use quent_query_engine_analyzer::ui::QuentViewer;
 use quent_query_engine_server::{
-    analyzer_cache::index_query_engines, analyzer_service_router, collector_service,
-    initialize_tracing,
+    analyzer_service_router_with_routes, collector_service, initialize_tracing,
 };
+use quent_store::event::{ModelEventStore, filesystem::Store};
 use tokio::net::TcpListener;
-use uuid::Uuid;
+
+type DuckDbContext = instrumentation::Context<instrumentation::DuckDb>;
+
+fn api_guard() -> axum::Router {
+    axum::Router::new().route(
+        "/api/{*path}",
+        axum::routing::any(|| async { axum::http::StatusCode::NOT_FOUND }),
+    )
+}
 
 #[derive(Parser)]
 struct Args {
@@ -65,8 +76,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     let collector = async {
-        collector_service::<DuckDBContext, _>(move |id| {
-            DuckDBContext::try_with_id(id, exporter.clone()).map_err(|error| error.to_string())
+        collector_service::<DuckDbContext, _>(move |id| {
+            DuckDbContext::try_with_id(id, exporter.clone()).map_err(|error| error.to_string())
         })?
         .serve(collector_addr)
         .await
@@ -75,19 +86,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let importer_dir = args.output_dir.clone();
     let index_dir = args.output_dir;
-    let importer = move |context_id: Uuid| {
-        let events = DuckDB::import_events(&importer_dir.join(context_id.to_string()))?
-            .collect::<quent_io::ImporterResult<Vec<_>>>()?;
-        Ok(Box::new(events.into_iter()) as Box<dyn Iterator<Item = _>>)
+    let importer = move |context_id| {
+        let events = Store::<DuckDb>::new(&importer_dir)
+            .events(context_id)
+            .map_err(quent_io::ImporterError::other)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(quent_io::ImporterError::other)?;
+        Ok::<Box<dyn Iterator<Item = _>>, quent_query_engine_server::error::ServerError>(Box::new(
+            events.into_iter(),
+        ))
     };
-    let lister = move || index_query_engines(&index_dir);
+    let lister = move || {
+        index_contexts(&index_dir, |context_dir| {
+            Ok(Viewer::context_inventory(context_dir)?)
+        })
+    };
     let analyzer = async {
         axum::serve(
             TcpListener::bind(analyzer_addr).await?,
-            analyzer_service_router::<DuckDbUiAnalyzer>(
+            analyzer_service_router_with_routes::<DuckDbUiAnalyzer>(
                 Box::new(importer),
                 Box::new(lister),
                 args.cors_address,
+                api_guard(),
             )?
             .into_make_service(),
         )
@@ -98,4 +119,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("listening on {collector_addr} and {analyzer_addr}");
     tokio::try_join!(collector, analyzer)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        Router,
+        body::Body,
+        http::{Request, StatusCode},
+        routing::get,
+    };
+    use tower::ServiceExt;
+
+    use super::api_guard;
+
+    #[tokio::test]
+    async fn api_guard_precedes_spa() {
+        let router = Router::new()
+            .route("/api/engines", get(|| async { StatusCode::OK }))
+            .merge(api_guard())
+            .fallback(get(|| async { StatusCode::OK }));
+
+        for (path, expected) in [
+            ("/api/engines", StatusCode::OK),
+            ("/api/nvtx/context", StatusCode::NOT_FOUND),
+            ("/query", StatusCode::OK),
+        ] {
+            let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+        }
+    }
 }

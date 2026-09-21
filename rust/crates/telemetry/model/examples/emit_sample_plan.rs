@@ -1,26 +1,26 @@
-//! Emit a minimal connected DuckDB physical plan for end-to-end UI validation.
+//! Emit a connected physical plan for end-to-end validation.
 
 use clap::Parser;
-use duckdb_telemetry_model::DuckDBContext;
-use duckdb_telemetry_model::{engine, operator, plan, port, query_group, worker};
+use duckdb_telemetry_model::{
+    Context, DuckDb, DynamicAttributes, Edge, Engine, EngineImplementation, Operator, Plan,
+    PlanParent, Port, Query, QueryGroup, Uuid, Worker,
+};
 use quent_io::clap::ExporterArgs;
-use quent_model::Ref;
-use uuid::{Uuid, uuid};
 
-const ENGINE: Uuid = uuid!("00000000-0000-0000-0000-000000000001");
-const WORKER: Uuid = uuid!("00000000-0000-0000-0000-000000000002");
-const QUERY_GROUP: Uuid = uuid!("00000000-0000-0000-0000-000000000003");
-const QUERY: Uuid = uuid!("00000000-0000-0000-0000-000000000004");
-const PLAN: Uuid = uuid!("00000000-0000-0000-0000-000000000005");
+type DuckDbContext = Context<DuckDb>;
 
-const TABLE_SCAN: Uuid = uuid!("00000000-0000-0000-0000-000000000006");
-const FILTER: Uuid = uuid!("00000000-0000-0000-0000-000000000007");
-const RESULT_COLLECTOR: Uuid = uuid!("00000000-0000-0000-0000-000000000008");
-
-const TABLE_SCAN_OUT: Uuid = uuid!("00000000-0000-0000-0000-000000000009");
-const FILTER_IN: Uuid = uuid!("00000000-0000-0000-0000-00000000000a");
-const FILTER_OUT: Uuid = uuid!("00000000-0000-0000-0000-00000000000b");
-const RESULT_COLLECTOR_IN: Uuid = uuid!("00000000-0000-0000-0000-00000000000c");
+const ENGINE: Uuid = Uuid::from_u128(1);
+const WORKER: Uuid = Uuid::from_u128(2);
+const QUERY_GROUP: Uuid = Uuid::from_u128(3);
+const QUERY: Uuid = Uuid::from_u128(4);
+const PLAN: Uuid = Uuid::from_u128(5);
+const TABLE_SCAN: Uuid = Uuid::from_u128(6);
+const FILTER: Uuid = Uuid::from_u128(7);
+const RESULT_COLLECTOR: Uuid = Uuid::from_u128(8);
+const TABLE_SCAN_OUT: Uuid = Uuid::from_u128(9);
+const FILTER_IN: Uuid = Uuid::from_u128(10);
+const FILTER_OUT: Uuid = Uuid::from_u128(11);
+const RESULT_COLLECTOR_IN: Uuid = Uuid::from_u128(12);
 
 #[derive(Parser, Debug)]
 #[command(about = "Emit a sample DuckDB query plan as Quent telemetry")]
@@ -31,96 +31,94 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let ctx = match args.exporter.into_options() {
-        Some(provider) => DuckDBContext::try_new(provider)?,
-        None => DuckDBContext::try_new(quent_model::Noop)?,
+    let context = match args.exporter.into_options() {
+        Some(provider) => DuckDbContext::try_new(provider)?,
+        None => DuckDbContext::try_new(duckdb_telemetry_model::Noop)?,
     };
 
-    let engine_observer = ctx.engine_observer();
-    let worker_observer = ctx.worker_observer();
-    let query_group_observer = ctx.query_group_observer();
-    let query_observer = ctx.query_observer();
-    let plan_observer = ctx.plan_observer();
-    let operator_observer = ctx.operator_observer();
-    let port_observer = ctx.port_observer();
-
-    engine_observer.create(ENGINE).init(engine::Init {
-        instance_name: Some("duckdb-sample".into()),
-        implementation: engine::EngineImplementationAttributes {
+    let mut engine = context.observer::<Engine>().handle_with_id(ENGINE);
+    engine.init(
+        EngineImplementation {
             name: Some("DuckDB".into()),
             version: None,
-            custom_attributes: Default::default(),
+            custom_attributes: DynamicAttributes::default(),
         },
-    });
-    worker_observer.create(WORKER).init(worker::Init {
-        parent_engine_id: Ref::new(ENGINE),
-        instance_name: "local".into(),
-    });
-    query_group_observer.declaration(
-        QUERY_GROUP,
-        query_group::Declaration {
-            engine_id: ENGINE,
-            instance_name: "sample-session".into(),
-        },
-    );
+        Some("duckdb-sample".into()),
+    )?;
 
-    let mut query =
-        query_observer.init(QUERY, "SELECT * FROM t WHERE i > 0", Ref::new(QUERY_GROUP));
-    query.planning();
+    let mut worker = context.observer::<Worker>().handle_with_id(WORKER);
+    worker.init(engine.as_entity_ref(), "local".into())?;
 
-    plan_observer.declaration(
-        PLAN,
-        plan::Declaration {
-            instance_name: "physical".into(),
-            parent: plan::PlanParent {
-                query_id: Some(Ref::new(QUERY)),
-                plan_id: None,
-            },
-            worker_id: Some(Ref::new(WORKER)),
-            edges: vec![
-                plan::Edge {
-                    source: Ref::new(TABLE_SCAN_OUT),
-                    target: Ref::new(FILTER_IN),
-                },
-                plan::Edge {
-                    source: Ref::new(FILTER_OUT),
-                    target: Ref::new(RESULT_COLLECTOR_IN),
-                },
-            ],
-        },
-    );
+    let mut query_group = context.observer::<QueryGroup>().handle_with_id(QUERY_GROUP);
+    query_group.declaration("sample-session".into(), engine.as_entity_ref())?;
 
+    let query = context
+        .observer::<Query>()
+        .handle_with_id(QUERY)
+        .init(
+            "SELECT * FROM t WHERE i > 0".into(),
+            query_group.as_entity_ref(),
+        )
+        .planning();
+
+    let plan_ref = context
+        .observer::<Plan>()
+        .handle_with_id(PLAN)
+        .as_entity_ref();
+    let mut operator_refs = Vec::new();
     for (id, instance_name, type_name) in [
         (TABLE_SCAN, "t", "TABLE_SCAN"),
         (FILTER, "i > 0", "FILTER"),
         (RESULT_COLLECTOR, "result", "RESULT_COLLECTOR"),
     ] {
-        operator_observer
-            .create(id)
-            .declaration(operator::Declaration {
-                plan_id: Ref::new(PLAN),
-                parent_operator_ids: vec![],
-                instance_name: instance_name.into(),
-                type_name: type_name.into(),
-                custom_attributes: Default::default(),
-            });
+        let mut operator = context.observer::<Operator>().handle_with_id(id);
+        operator.declaration(
+            plan_ref.clone(),
+            Vec::new(),
+            instance_name.into(),
+            type_name.into(),
+            DynamicAttributes::default(),
+        )?;
+        operator_refs.push(operator);
     }
 
-    for (id, operator_id, instance_name) in [
-        (TABLE_SCAN_OUT, TABLE_SCAN, "out"),
-        (FILTER_IN, FILTER, "in"),
-        (FILTER_OUT, FILTER, "out"),
-        (RESULT_COLLECTOR_IN, RESULT_COLLECTOR, "in"),
+    let mut ports = Vec::new();
+    for (id, operator_index, instance_name) in [
+        (TABLE_SCAN_OUT, 0, "out"),
+        (FILTER_IN, 1, "in"),
+        (FILTER_OUT, 1, "out"),
+        (RESULT_COLLECTOR_IN, 2, "in"),
     ] {
-        port_observer.create(id).declaration(port::Declaration {
-            operator_id: Ref::new(operator_id),
-            instance_name: instance_name.into(),
-        });
+        let mut port = context.observer::<Port>().handle_with_id(id);
+        port.declaration(
+            operator_refs[operator_index].as_entity_ref(),
+            instance_name.into(),
+        )?;
+        ports.push(port);
     }
 
-    query.executing();
-    query.exit();
-    worker_observer.create(WORKER).exit(worker::Exit);
-    engine_observer.create(ENGINE).exit(engine::Exit);
+    let mut plan = context.observer::<Plan>().handle_with_id(PLAN);
+    plan.declaration(
+        PlanParent {
+            query_id: query.as_entity_ref(),
+            plan_id: None,
+        },
+        "physical".into(),
+        vec![
+            Edge {
+                source: ports[0].as_entity_ref(),
+                target: ports[1].as_entity_ref(),
+            },
+            Edge {
+                source: ports[2].as_entity_ref(),
+                target: ports[3].as_entity_ref(),
+            },
+        ],
+        Some(worker.as_entity_ref()),
+    )?;
+
+    query.executing().exit();
+    worker.exit()?;
+    engine.exit()?;
     Ok(())
 }

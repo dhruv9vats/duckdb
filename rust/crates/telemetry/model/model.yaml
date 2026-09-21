@@ -1,0 +1,338 @@
+# DuckDB's Quent model. Rust instrumentation, stored events, C++ bindings, and
+# analyzer contracts are generated or derived from this file.
+
+quent: alpha
+model: DuckDB
+doc: DuckDB query structure, runtime work, and resource telemetry.
+
+records:
+  EngineImplementation:
+    fields:
+      name: { option: string }
+      version: { option: string }
+      custom_attributes: dynamic
+
+  Edge:
+    fields:
+      source: { ref: Port }
+      target: { ref: Port }
+
+  PlanParent:
+    fields:
+      query_id: { scope-ref: Query }
+      plan_id: { option: { ref: Plan } }
+
+entities:
+  Engine:
+    doc: One DuckDB DatabaseInstance and the reference-tree root.
+    events:
+      init:
+        attributes:
+          implementation: EngineImplementation
+          instance_name: { option: string }
+      exit: {}
+
+  Worker:
+    doc: The local execution backend, not an OS thread.
+    events:
+      init:
+        attributes:
+          parent_engine_id: { scope-ref: Engine }
+          instance_name: string
+      exit: {}
+
+  QueryGroup:
+    doc: One ClientContext connection or session.
+    events:
+      declaration:
+        attributes:
+          instance_name: string
+          engine_id: { scope-ref: Engine }
+
+  Plan:
+    doc: One execution-specific physical operator DAG.
+    events:
+      declaration:
+        attributes:
+          parent: PlanParent
+          instance_name: string
+          edges: { list: Edge }
+          worker_id: { option: { ref: Worker } }
+
+  Operator:
+    doc: One PhysicalOperator in a physical plan.
+    events:
+      declaration:
+        attributes:
+          plan_id: { scope-ref: Plan }
+          parent_operator_ids: { list: { ref: Operator } }
+          instance_name: string
+          type_name: string
+          custom_attributes: dynamic
+      statistics:
+        attributes:
+          custom_attributes: dynamic
+
+  Port:
+    doc: One physical input or output attachment.
+    events:
+      declaration:
+        attributes:
+          operator_id: { scope-ref: Operator }
+          instance_name: string
+      statistics:
+        attributes:
+          custom_attributes: dynamic
+
+fsms:
+  Query:
+    doc: One executable statement from physical-plan availability to completion.
+    states:
+      init:
+        initial: true
+        attributes:
+          instance_name: string
+          query_group_id: { scope-ref: QueryGroup }
+        to: [planning]
+      planning:
+        to: [executing]
+      executing:
+        to: [exit]
+      exit: {}
+
+  PipelineTask:
+    doc: One scheduled executor of a DuckDB pipeline.
+    states:
+      created:
+        initial: true
+        attributes:
+          instance_name: string
+          query_id: { scope-ref: Query }
+          plan_id: { ref: Plan }
+          worker_id: { ref: Worker }
+          operator_ids: { list: { ref: Operator } }
+          task_index: u64
+          queue: { uses: TaskQueue }
+        to: [running, finalizing]
+      running:
+        attributes:
+          mode: string
+          cpu_id: u64
+          execution_thread: { uses: ExecutionThread }
+        to: [ready, blocked, finalizing]
+      ready:
+        attributes:
+          queue: { uses: TaskQueue }
+        to: [running, finalizing]
+      blocked:
+        to: [running, finalizing]
+      finalizing:
+        attributes:
+          success: bool
+        to: [exit]
+      exit: {}
+
+  ChunkTransfer:
+    doc: One nonempty DataChunk publication across a physical-plan edge.
+    states:
+      produced:
+        initial: true
+        attributes:
+          instance_name: string
+          query_id: { scope-ref: Query }
+          task_id: { option: { ref: PipelineTask } }
+          source_operator_id: { ref: Operator }
+          source_port_id: { ref: Port }
+          target_operator_id: { ref: Operator }
+          target_port_id: { ref: Port }
+          rows: u64
+          logical_bytes: u64
+        to: [published]
+      published:
+        to: [exit]
+      exit: {}
+
+  OperatorInvocation:
+    doc: One call into a physical operator from PipelineExecutor.
+    states:
+      invocation_created:
+        initial: true
+        attributes:
+          instance_name: string
+          query_id: { scope-ref: Query }
+          plan_id: { ref: Plan }
+          task_id: { option: { ref: PipelineTask } }
+          operator_id: { ref: Operator }
+          phase: string
+        to: [invocation_running, invocation_completed]
+      invocation_running:
+        attributes:
+          input_rows: u64
+          input_logical_bytes: u64
+          execution_thread: { uses: ExecutionThread }
+        to: [invocation_completed]
+      invocation_completed:
+        attributes:
+          success: bool
+          output_rows: u64
+          output_logical_bytes: u64
+        to: [exit]
+      exit: {}
+
+  TemporaryBlockIo:
+    doc: One synchronous temporary-buffer spill or reload operation.
+    states:
+      io_requested:
+        initial: true
+        attributes:
+          instance_name: string
+          query_id: { scope-ref: Query }
+          plan_id: { ref: Plan }
+          task_id: { option: { ref: PipelineTask } }
+          trigger_operator_id: { option: { ref: Operator } }
+          block_id: u64
+          memory_tag: string
+          direction: string
+        to: [io_active, io_completed]
+      io_active:
+        attributes:
+          channel: { uses: TemporaryIoChannel }
+        to: [io_completed]
+      io_completed:
+        attributes:
+          success: bool
+          storage_bytes: u64
+        to: [exit]
+      exit: {}
+
+  MemoryAccount:
+    doc: One absolute occupancy gauge for a memory tag and accounting domain.
+    states:
+      account_registered:
+        initial: true
+        attributes:
+          instance_name: string
+          engine_id: { scope-ref: Engine }
+          memory_tag: string
+        to: [accounted]
+      accounted:
+        attributes:
+          buffer_pool: { option: { uses: BufferPoolMemory } }
+          temporary_storage: { option: { uses: TemporaryStorage } }
+          temporary_directory: { option: { uses: TemporaryDirectoryStorage } }
+        to: [accounted, exit]
+      exit: {}
+
+  ExecutionThread:
+    doc: A stable OS thread that executes DuckDB pipeline work.
+    resource: true
+    states:
+      initializing:
+        initial: true
+        attributes:
+          instance_name: string
+          worker_id: { scope-ref: Worker }
+        to: [operating]
+      operating:
+        to: [finalizing]
+      finalizing:
+        to: [exit]
+      exit: {}
+
+  TaskQueue:
+    doc: DuckDB pipeline tasks ready for scheduler dispatch.
+    resource:
+      entries: { kind: occupancy }
+    states:
+      initializing:
+        initial: true
+        attributes:
+          instance_name: string
+          worker_id: { scope-ref: Worker }
+        to: [operating]
+      operating:
+        to: [finalizing]
+      finalizing:
+        to: [exit]
+      exit: {}
+
+  TemporaryIoChannel:
+    doc: Synchronous temporary-storage I/O service path.
+    resource:
+      operations: { kind: rate }
+      buffer_bytes: { kind: rate }
+    states:
+      initializing:
+        initial: true
+        attributes:
+          instance_name: string
+          worker_id: { scope-ref: Worker }
+        to: [operating]
+      operating:
+        to: [finalizing]
+      finalizing:
+        to: [exit]
+      exit: {}
+
+  BufferPoolMemory:
+    doc: Bytes charged to DuckDB's buffer-pool accounting.
+    resource:
+      bytes: { kind: occupancy, known-bounds: true }
+    states:
+      initializing:
+        initial: true
+        attributes:
+          instance_name: string
+          engine_id: { scope-ref: Engine }
+        to: [operating]
+      operating:
+        attributes:
+          limits: { sets-resource-bounds: true }
+        to: [resizing, finalizing]
+      resizing:
+        to: [operating]
+      finalizing:
+        to: [exit]
+      exit: {}
+
+  TemporaryStorage:
+    doc: Live buffer representations held in temporary storage.
+    resource:
+      bytes: { kind: occupancy, known-bounds: true }
+    states:
+      initializing:
+        initial: true
+        attributes:
+          instance_name: string
+          engine_id: { scope-ref: Engine }
+        to: [operating]
+      operating:
+        attributes:
+          limits: { sets-resource-bounds: true }
+        to: [resizing, finalizing]
+      resizing:
+        to: [operating]
+      finalizing:
+        to: [exit]
+      exit: {}
+
+  TemporaryDirectoryStorage:
+    doc: Accounted temporary-directory extent charged to the swap limit.
+    resource:
+      bytes: { kind: occupancy, known-bounds: true }
+    states:
+      initializing:
+        initial: true
+        attributes:
+          instance_name: string
+          engine_id: { scope-ref: Engine }
+        to: [operating]
+      operating:
+        attributes:
+          limits: { sets-resource-bounds: true }
+        to: [resizing, finalizing]
+      resizing:
+        to: [operating]
+      finalizing:
+        to: [exit]
+      exit: {}

@@ -2,26 +2,7 @@
 
 #ifdef DUCKDB_QUENT_TELEMETRY
 
-#include "duckdb-telemetry-bridge/gen/context.rs.h"
-#include "duckdb-telemetry-bridge/gen/buffer_pool_memory.rs.h"
-#include "duckdb-telemetry-bridge/gen/chunk_transfer.rs.h"
-#include "duckdb-telemetry-bridge/gen/engine.rs.h"
-#include "duckdb-telemetry-bridge/gen/operator.rs.h"
-#include "duckdb-telemetry-bridge/gen/operator_invocation.rs.h"
-#include "duckdb-telemetry-bridge/gen/memory_account.rs.h"
-#include "duckdb-telemetry-bridge/gen/pipeline_task.rs.h"
-#include "duckdb-telemetry-bridge/gen/plan.rs.h"
-#include "duckdb-telemetry-bridge/gen/port.rs.h"
-#include "duckdb-telemetry-bridge/gen/query.rs.h"
-#include "duckdb-telemetry-bridge/gen/query_group.rs.h"
-#include "duckdb-telemetry-bridge/gen/execution_thread.rs.h"
-#include "duckdb-telemetry-bridge/gen/task_queue.rs.h"
-#include "duckdb-telemetry-bridge/gen/temporary_block_io.rs.h"
-#include "duckdb-telemetry-bridge/gen/temporary_directory_storage.rs.h"
-#include "duckdb-telemetry-bridge/gen/temporary_io_channel.rs.h"
-#include "duckdb-telemetry-bridge/gen/temporary_storage.rs.h"
-#include "duckdb-telemetry-bridge/gen/uuid.rs.h"
-#include "duckdb-telemetry-bridge/gen/worker.rs.h"
+#include "duckdb-telemetry-bridge/gen/quent.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/enum_util.hpp"
@@ -45,6 +26,8 @@
 #include "duckdb/storage/memory_usage_probe.hpp"
 #include "duckdb/storage/temporary_io_probe.hpp"
 
+#include <variant>
+
 namespace duckdb {
 
 static constexpr const char *TELEMETRY_STATE_NAME = "quent_telemetry";
@@ -63,6 +46,25 @@ static constexpr const char *TEMP_DIRECTORY_ACCOUNT_TAG = "UNKNOWN";
 
 enum class TelemetryIoOutcome : uint8_t { SUCCESS, FAILURE };
 enum class MemoryTelemetryMode : uint8_t { ENABLED, DISABLED };
+
+using QueryExecuting = quent::FsmHandle<quent::Query, quent::query_state::Executing>;
+using TaskCreatedHandle = quent::FsmHandle<quent::PipelineTask, quent::pipeline_task_state::Created>;
+using TaskRunningHandle = quent::FsmHandle<quent::PipelineTask, quent::pipeline_task_state::Running>;
+using TaskReadyHandle = quent::FsmHandle<quent::PipelineTask, quent::pipeline_task_state::Ready>;
+using TaskBlockedHandle = quent::FsmHandle<quent::PipelineTask, quent::pipeline_task_state::Blocked>;
+using TaskFinalizing = quent::FsmHandle<quent::PipelineTask, quent::pipeline_task_state::Finalizing>;
+using TaskState = std::variant<TaskCreatedHandle, TaskRunningHandle, TaskReadyHandle, TaskBlockedHandle>;
+using InvocationRunning =
+    quent::FsmHandle<quent::OperatorInvocation, quent::operator_invocation_state::InvocationRunning>;
+using IoActive = quent::FsmHandle<quent::TemporaryBlockIo, quent::temporary_block_io_state::IoActive>;
+using Accounted = quent::FsmHandle<quent::MemoryAccount, quent::memory_account_state::Accounted>;
+using ThreadOperating = quent::FsmHandle<quent::ExecutionThread, quent::execution_thread_state::Operating>;
+using QueueOperating = quent::FsmHandle<quent::TaskQueue, quent::task_queue_state::Operating>;
+using IoChannelOperating = quent::FsmHandle<quent::TemporaryIoChannel, quent::temporary_io_channel_state::Operating>;
+using BufferPoolOperating = quent::FsmHandle<quent::BufferPoolMemory, quent::buffer_pool_memory_state::Operating>;
+using TempStorageOperating = quent::FsmHandle<quent::TemporaryStorage, quent::temporary_storage_state::Operating>;
+using TempDirectoryOperating =
+    quent::FsmHandle<quent::TemporaryDirectoryStorage, quent::temporary_directory_storage_state::Operating>;
 
 static const char *OperatorPhaseName(TelemetryOperatorPhase phase) {
 	switch (phase) {
@@ -90,8 +92,7 @@ static const char *IoDirectionName(TemporaryIoDirection direction) {
 
 class QuentTemporaryIoEvent final : public TemporaryIoEvent {
 public:
-	explicit QuentTemporaryIoEvent(rust::Box<quent::temporary_block_io::TemporaryBlockIoHandle> handle_p)
-	    : handle(std::move(handle_p)) {
+	explicit QuentTemporaryIoEvent(IoActive handle_p) : handle(std::move(handle_p)) {
 	}
 
 	~QuentTemporaryIoEvent() override {
@@ -116,37 +117,37 @@ private:
 		finished = true;
 
 		quent::temporary_block_io::IoCompleted completed;
-		completed.instance_name = "";
 		completed.success = outcome == TelemetryIoOutcome::SUCCESS;
 		completed.storage_bytes = storage_bytes;
-		handle->io_completed(std::move(completed));
-		handle->exit();
+		auto completed_handle = std::move(handle).io_completed(std::move(completed));
+		std::move(completed_handle).exit();
 	}
 
 private:
-	rust::Box<quent::temporary_block_io::TemporaryBlockIoHandle> handle;
+	IoActive handle;
 	bool finished = false;
 };
 
 struct OperatorIds {
-	uuid::UUID operator_id;
-	uuid::UUID output_port_id;
+	quent::Uuid operator_id;
+	quent::Uuid output_port_id;
 	bool output_declared;
 };
 
 struct PlanEdgeIds {
 	reference<const PhysicalOperator> source;
 	reference<const PhysicalOperator> target;
-	uuid::UUID source_port_id;
-	uuid::UUID target_port_id;
+	quent::Uuid source_port_id;
+	quent::Uuid target_port_id;
 };
 
 struct RuntimePlan {
-	uuid::UUID plan_id;
+	quent::Uuid plan_id;
 	reference_map_t<const PhysicalOperator, OperatorIds> operators;
 	vector<PlanEdgeIds> edges;
+	unordered_map<const PhysicalOperator *, unordered_map<const PhysicalOperator *, idx_t>> edge_index;
 
-	bool FindOperator(const PhysicalOperator &op, uuid::UUID &operator_id) const {
+	bool FindOperator(const PhysicalOperator &op, quent::Uuid &operator_id) const {
 		auto entry = operators.find(std::cref(op));
 		if (entry == operators.end()) {
 			return false;
@@ -155,67 +156,76 @@ struct RuntimePlan {
 		return true;
 	}
 
-	bool FindEdge(const PhysicalOperator &source, const PhysicalOperator &target, uuid::UUID &source_operator_id,
-	              uuid::UUID &source_port_id, uuid::UUID &target_operator_id, uuid::UUID &target_port_id) const {
-		for (auto &edge : edges) {
-			if (&edge.source.get() == &source && &edge.target.get() == &target) {
-				auto source_entry = operators.find(std::cref(source));
-				auto target_entry = operators.find(std::cref(target));
-				D_ASSERT(source_entry != operators.end());
-				D_ASSERT(target_entry != operators.end());
-				source_operator_id = source_entry->second.operator_id;
-				source_port_id = edge.source_port_id;
-				target_operator_id = target_entry->second.operator_id;
-				target_port_id = edge.target_port_id;
-				return true;
-			}
+	bool FindEdge(const PhysicalOperator &source, const PhysicalOperator &target, quent::Uuid &source_operator_id,
+	              quent::Uuid &source_port_id, quent::Uuid &target_operator_id, quent::Uuid &target_port_id) const {
+		auto source_edges = edge_index.find(&source);
+		if (source_edges == edge_index.end()) {
+			return false;
 		}
-		return false;
+		auto edge_entry = source_edges->second.find(&target);
+		if (edge_entry == source_edges->second.end()) {
+			return false;
+		}
+
+		auto source_entry = operators.find(std::cref(source));
+		auto target_entry = operators.find(std::cref(target));
+		D_ASSERT(source_entry != operators.end());
+		D_ASSERT(target_entry != operators.end());
+		auto &edge = edges[edge_entry->second];
+		source_operator_id = source_entry->second.operator_id;
+		source_port_id = edge.source_port_id;
+		target_operator_id = target_entry->second.operator_id;
+		target_port_id = edge.target_port_id;
+		return true;
 	}
 };
 
 struct TaskTelemetry {
-	explicit TaskTelemetry(rust::Box<quent::pipeline_task::PipelineTaskHandle> handle_p)
-	    : handle(std::move(handle_p)), task_id(handle->uuid()) {
+	explicit TaskTelemetry(TaskCreatedHandle handle_p) : task_id(handle_p.id().raw()), handle(std::move(handle_p)) {
 	}
 
-	rust::Box<quent::pipeline_task::PipelineTaskHandle> handle;
-	uuid::UUID task_id;
+	quent::Uuid task_id;
+	TaskState handle;
 };
 
 struct InvocationTelemetry {
-	explicit InvocationTelemetry(rust::Box<quent::operator_invocation::OperatorInvocationHandle> handle_p,
-	                             uuid::UUID task_id_p)
-	    : handle(std::move(handle_p)), task_id(task_id_p) {
+	explicit InvocationTelemetry(InvocationRunning handle_p, std::optional<quent::Uuid> task_id_p,
+	                             uint64_t generation_p)
+	    : handle(std::move(handle_p)), task_id(task_id_p), generation(generation_p) {
 	}
 
-	rust::Box<quent::operator_invocation::OperatorInvocationHandle> handle;
-	uuid::UUID task_id;
+	InvocationRunning handle;
+	std::optional<quent::Uuid> task_id;
+	uint64_t generation;
 };
 
 struct MemoryAccountTelemetry {
-	optional<rust::Box<quent::memory_account::MemoryAccountHandle>> handle;
+	optional<Accounted> handle;
 	uint64_t bytes = 0;
 };
 
 struct IoAttribution {
-	const_reference<PipelineExecutor> executor;
-	uuid::UUID query_id;
-	uuid::UUID plan_id;
-	uuid::UUID task_id;
-	uuid::UUID operator_id;
+	const void *owner;
+	const PipelineExecutor *executor;
+	quent::Uuid query_id;
+	quent::Uuid plan_id;
+	std::optional<quent::Uuid> task_id;
+	quent::Uuid operator_id;
+	uint64_t generation;
 };
 
 static thread_local vector<IoAttribution> active_io_attributions;
 
-static void PushIoAttribution(const PipelineExecutor &executor, uuid::UUID query_id, uuid::UUID plan_id,
-                              uuid::UUID task_id, uuid::UUID operator_id) {
-	active_io_attributions.push_back({std::cref(executor), query_id, plan_id, task_id, operator_id});
+static void PushIoAttribution(const void *owner, const PipelineExecutor &executor, quent::Uuid query_id,
+                              quent::Uuid plan_id, std::optional<quent::Uuid> task_id, quent::Uuid operator_id,
+                              uint64_t generation) {
+	active_io_attributions.push_back({owner, &executor, query_id, plan_id, task_id, operator_id, generation});
 }
 
-static void RemoveIoAttribution(const PipelineExecutor &executor) {
+static void RemoveIoAttribution(const void *owner, const PipelineExecutor &executor) {
 	for (idx_t index = active_io_attributions.size(); index > 0; index--) {
-		if (&active_io_attributions[index - 1].executor.get() != &executor) {
+		auto &attribution = active_io_attributions[index - 1];
+		if (attribution.owner != owner || attribution.executor != &executor) {
 			continue;
 		}
 
@@ -224,53 +234,78 @@ static void RemoveIoAttribution(const PipelineExecutor &executor) {
 	}
 }
 
-static optional<IoAttribution> CurrentIoAttribution(uuid::UUID query_id) {
-	for (idx_t index = active_io_attributions.size(); index > 0; index--) {
-		auto &attribution = active_io_attributions[index - 1];
-		if (attribution.query_id == query_id) {
-			return attribution;
-		}
-	}
-	return nullopt;
-}
+struct ExecutionThreadCache {
+	const void *owner;
+	quent::Uuid engine_id;
+	quent::Uuid thread_id;
+};
+
+static thread_local vector<ExecutionThreadCache> execution_thread_cache;
 
 class PlanEmitter {
 public:
-	PlanEmitter(const quent::Context &context, RuntimePlan &runtime_plan_p, uuid::UUID query_id_p,
-	            uuid::UUID worker_id_p)
+	PlanEmitter(RuntimePlan &runtime_plan_p, quent::Uuid query_id_p, quent::Uuid worker_id_p,
+	            const std::shared_ptr<quent::operator_::OperatorObserver> &operator_observer_p,
+	            const std::shared_ptr<quent::port::PortObserver> &port_observer_p,
+	            const std::shared_ptr<quent::plan::PlanObserver> &plan_observer_p)
 	    : runtime_plan(runtime_plan_p), query_id(query_id_p), worker_id(worker_id_p),
-	      operator_observer(quent::operator_::create_observer(context)),
-	      port_observer(quent::port::create_observer(context)), plan_observer(quent::plan::create_observer(context)) {
-		runtime_plan.plan_id = uuid::now_v7();
+	      operator_observer(operator_observer_p), port_observer(port_observer_p), plan_observer(plan_observer_p) {
+		runtime_plan.plan_id = quent::now_v7();
 	}
 
 	void Emit(const PhysicalOperator &root) {
-		EmitOperator(root);
+		DiscoverOperator(root);
+		DeclareOperators();
+		EmitEdges(root);
 
-		quent::plan::Declaration declaration;
-		declaration.parent.query_id = query_id;
-		declaration.parent.plan_id = uuid::new_nil();
-		declaration.instance_name = "physical";
-		declaration.edges = std::move(edges);
-		declaration.worker_id = worker_id;
-		plan_observer->declaration(runtime_plan.plan_id, std::move(declaration));
+		quent::plan::Declaration declaration {{quent::query::QueryId(query_id), std::nullopt},
+		                                      "physical",
+		                                      std::move(edges),
+		                                      quent::worker::WorkerId(worker_id)};
+		plan_observer->handle(quent::plan::PlanId(runtime_plan.plan_id)).declaration(std::move(declaration));
 	}
 
 private:
-	void EmitOperator(const PhysicalOperator &op) {
+	void DiscoverOperator(const PhysicalOperator &op) {
 		auto entry = runtime_plan.operators.find(std::cref(op));
 		if (entry != runtime_plan.operators.end()) {
 			return;
 		}
 
-		OperatorIds ids {uuid::now_v7(), uuid::now_v7(), false};
-		runtime_plan.operators.emplace(std::cref(op), ids);
+		OperatorIds ids {quent::now_v7(), quent::now_v7(), false};
+		runtime_plan.operators.emplace(std::cref(op), std::move(ids));
 
-		quent::operator_::Declaration declaration;
-		declaration.plan_id = runtime_plan.plan_id;
-		declaration.instance_name = op.GetName();
-		declaration.type_name = PhysicalOperatorToString(op.type);
-		operator_observer->declaration(ids.operator_id, std::move(declaration));
+		if (op.type == PhysicalOperatorType::MERGE_INTO) {
+			auto &merge = op.Cast<PhysicalMergeInto>();
+			for (auto &action : merge.actions) {
+				if (!action->op) {
+					continue;
+				}
+				DiscoverOperator(*action->op);
+			}
+		}
+
+		for (auto &child : op.GetChildren()) {
+			DiscoverOperator(child.get());
+		}
+	}
+
+	void DeclareOperators() {
+		for (auto &entry : runtime_plan.operators) {
+			quent::operator_::Declaration declaration {quent::plan::PlanId(runtime_plan.plan_id),
+			                                           {},
+			                                           entry.first.get().GetName(),
+			                                           PhysicalOperatorToString(entry.first.get().type),
+			                                           {}};
+			operator_observer->handle(quent::operator_::OperatorId(entry.second.operator_id))
+			    .declaration(std::move(declaration));
+		}
+	}
+
+	void EmitEdges(const PhysicalOperator &op) {
+		if (!expanded.insert(&op).second) {
+			return;
+		}
 
 		if (op.type == PhysicalOperatorType::MERGE_INTO) {
 			auto &merge = op.Cast<PhysicalMergeInto>();
@@ -279,19 +314,17 @@ private:
 				if (!action->op) {
 					continue;
 				}
-				EmitOperator(*action->op);
-				auto action_entry = runtime_plan.operators.find(std::cref(*action->op));
-				D_ASSERT(action_entry != runtime_plan.operators.end());
 				AddEdge(op, *action->op, "action-in-" + std::to_string(action_index));
+				EmitEdges(*action->op);
 			}
 		}
 
 		auto children = op.GetChildren();
 		for (idx_t child_index = 0; child_index < children.size(); child_index++) {
 			auto &child = children[child_index].get();
-			EmitOperator(child);
 			auto input_name = children.size() == 1 ? string("in") : "in-" + std::to_string(child_index);
 			AddEdge(child, op, input_name);
+			EmitEdges(child);
 		}
 	}
 
@@ -306,48 +339,47 @@ private:
 			source_ids.output_declared = true;
 		}
 
-		auto input_port_id = uuid::now_v7();
+		auto input_port_id = quent::now_v7();
 		DeclarePort(input_port_id, target_entry->second.operator_id, target_name);
-		quent::plan::Edges edge;
-		edge.source = source_ids.output_port_id;
-		edge.target = input_port_id;
+		quent::records::Edge edge {quent::port::PortId(source_ids.output_port_id), quent::port::PortId(input_port_id)};
 		edges.push_back(std::move(edge));
 		runtime_plan.edges.push_back({std::cref(source), std::cref(target), source_ids.output_port_id, input_port_id});
+		auto edge_index = runtime_plan.edges.size() - 1;
+		runtime_plan.edge_index[&source].emplace(&target, edge_index);
 	}
 
-	void DeclarePort(uuid::UUID id, uuid::UUID operator_id, const string &name) {
-		quent::port::Declaration declaration;
-		declaration.operator_id = operator_id;
-		declaration.instance_name = name;
-		port_observer->declaration(id, std::move(declaration));
+	void DeclarePort(quent::Uuid id, quent::Uuid operator_id, const string &name) {
+		quent::port::Declaration declaration {quent::operator_::OperatorId(operator_id), name};
+		port_observer->handle(quent::port::PortId(id)).declaration(std::move(declaration));
 	}
 
 private:
 	RuntimePlan &runtime_plan;
-	uuid::UUID query_id;
-	uuid::UUID worker_id;
-	rust::Box<quent::operator_::OperatorObserver> operator_observer;
-	rust::Box<quent::port::PortObserver> port_observer;
-	rust::Box<quent::plan::PlanObserver> plan_observer;
-	rust::Vec<quent::plan::Edges> edges;
+	quent::Uuid query_id;
+	quent::Uuid worker_id;
+	std::shared_ptr<quent::operator_::OperatorObserver> operator_observer;
+	std::shared_ptr<quent::port::PortObserver> port_observer;
+	std::shared_ptr<quent::plan::PlanObserver> plan_observer;
+	std::vector<quent::records::Edge> edges;
+	unordered_set<const PhysicalOperator *> expanded;
 };
 
-static rust::Box<quent::ExporterOptions> CreateExporter(const string &name) {
+static quent::Context CreateContext(const string &name) {
 	if (name == "ndjson") {
 		auto output_dir = FileSystem::GetEnvVariable(OUTPUT_DIR_ENV);
-		return quent::ExporterOptions::ndjson(output_dir.empty() ? DEFAULT_OUTPUT_DIR : output_dir);
+		return quent::Context::ndjson(output_dir.empty() ? DEFAULT_OUTPUT_DIR : output_dir);
 	}
 	if (name == "msgpack" || name == "messagepack") {
 		auto output_dir = FileSystem::GetEnvVariable(OUTPUT_DIR_ENV);
-		return quent::ExporterOptions::msgpack(output_dir.empty() ? DEFAULT_OUTPUT_DIR : output_dir);
+		return quent::Context::msgpack(output_dir.empty() ? DEFAULT_OUTPUT_DIR : output_dir);
 	}
 	if (name == "postcard") {
 		auto output_dir = FileSystem::GetEnvVariable(OUTPUT_DIR_ENV);
-		return quent::ExporterOptions::postcard(output_dir.empty() ? DEFAULT_OUTPUT_DIR : output_dir);
+		return quent::Context::postcard(output_dir.empty() ? DEFAULT_OUTPUT_DIR : output_dir);
 	}
 	if (name == "collector") {
 		auto address = FileSystem::GetEnvVariable(COLLECTOR_ADDRESS_ENV);
-		return quent::ExporterOptions::collector(address.empty() ? DEFAULT_COLLECTOR_ADDRESS : address);
+		return quent::Context::collector(address.empty() ? DEFAULT_COLLECTOR_ADDRESS : address);
 	}
 	throw InvalidInputException("Unknown Quent exporter: %s", name);
 }
@@ -359,50 +391,65 @@ public:
 	class ClientState : public ClientContextState {
 	public:
 		explicit ClientState(shared_ptr<Impl> telemetry_p)
-		    : telemetry(std::move(telemetry_p)), query_group_id(uuid::now_v7()) {
+		    : telemetry(std::move(telemetry_p)), query_group_id(quent::now_v7()) {
 		}
 
 		~ClientState() override {
-			FinishQuery();
+			try {
+				FinishQuery();
+			} catch (...) {
+			}
 		}
 
 		void QueryBegin(ClientContext &context) override {
-			FinishQuery();
-			if (!query_group_declared) {
-				quent::query_group::Declaration declaration;
-				if (context.GetConnectionId() == DConstants::INVALID_INDEX) {
-					declaration.instance_name = "internal-connection";
-				} else {
-					declaration.instance_name = "connection-" + std::to_string(context.GetConnectionId());
+			try {
+				FinishQuery();
+				if (!query_group_declared) {
+					string instance_name;
+					if (context.GetConnectionId() == DConstants::INVALID_INDEX) {
+						instance_name = "internal-connection";
+					} else {
+						instance_name = "connection-" + std::to_string(context.GetConnectionId());
+					}
+					quent::query_group::Declaration declaration {std::move(instance_name),
+					                                             quent::engine::EngineId(telemetry->engine_id)};
+					telemetry->query_group_observer->handle(quent::query_group::QueryGroupId(query_group_id))
+					    .declaration(std::move(declaration));
+					query_group_declared = true;
 				}
-				declaration.engine_id = telemetry->engine_id;
-				telemetry->query_group_observer->declaration(query_group_id, std::move(declaration));
-				query_group_declared = true;
+				query_text = context.GetCurrentQuery();
+			} catch (...) {
+				query_text.reset();
 			}
-			query_text = context.GetCurrentQuery();
 		}
 
 		void QueryEnd(ClientContext &, optional_ptr<ErrorData>) override {
-			FinishQuery();
+			try {
+				FinishQuery();
+			} catch (...) {
+			}
 		}
 
 		void StartExecution(const PhysicalOperator &root) {
-			D_ASSERT(query_text);
-			quent::query::Init init;
-			init.instance_name = std::move(*query_text);
-			init.query_group_id = query_group_id;
-			query.emplace(quent::query::create(*telemetry->context, std::move(init)));
-			query_text.reset();
-			(*query)->planning();
-			try {
-				auto new_plan = make_uniq<RuntimePlan>();
-				PlanEmitter(*telemetry->context, *new_plan, (*query)->uuid(), telemetry->worker_id).Emit(root);
-				plan = std::move(new_plan);
-			} catch (...) {
-				(*query)->executing();
+			if (!query_text) {
 				return;
 			}
-			(*query)->executing();
+			quent::query::Init init {std::move(*query_text), quent::query_group::QueryGroupId(query_group_id)};
+			auto initialized = std::move(telemetry->query_observer->handle()).init(std::move(init));
+			query_text.reset();
+			auto planning = std::move(initialized).planning();
+			auto query_id = planning.id().raw();
+			try {
+				auto new_plan = make_uniq<RuntimePlan>();
+				PlanEmitter(*new_plan, query_id, telemetry->worker_id, telemetry->operator_observer,
+				            telemetry->port_observer, telemetry->plan_observer)
+				    .Emit(root);
+				plan = std::move(new_plan);
+			} catch (...) {
+				query.emplace(std::move(planning).executing());
+				return;
+			}
+			query.emplace(std::move(planning).executing());
 		}
 
 		void TaskCreated(const PipelineTask &task, const Pipeline &pipeline) {
@@ -411,21 +458,22 @@ public:
 				return;
 			}
 
-			quent::pipeline_task::Created created;
-			created.instance_name = "pipeline-task-" + std::to_string(next_task_index);
-			created.query_id = (*query)->uuid();
-			created.plan_id = plan->plan_id;
-			created.worker_id = telemetry->worker_id;
-			created.task_index = next_task_index++;
-			created.queue_resource_id = telemetry->TaskQueueId();
-			created.queue_capacity_entries = 1;
+			vector<quent::operator_::OperatorId> operator_ids;
 			for (auto &op : pipeline.GetOperators()) {
-				uuid::UUID operator_id;
+				quent::Uuid operator_id;
 				if (plan->FindOperator(op.get(), operator_id)) {
-					created.operator_ids.push_back(operator_id);
+					operator_ids.emplace_back(operator_id);
 				}
 			}
-			auto handle = quent::pipeline_task::create(*telemetry->context, std::move(created));
+			auto task_index = next_task_index++;
+			quent::pipeline_task::Created created {"pipeline-task-" + std::to_string(task_index),
+			                                       query->id(),
+			                                       quent::plan::PlanId(plan->plan_id),
+			                                       quent::worker::WorkerId(telemetry->worker_id),
+			                                       std::move(operator_ids),
+			                                       task_index,
+			                                       {quent::task_queue::TaskQueueId(telemetry->TaskQueueId()), {1}}};
+			auto handle = std::move(telemetry->pipeline_task_observer->handle()).created(std::move(created));
 			tasks.emplace(std::cref(task), TaskTelemetry(std::move(handle)));
 		}
 
@@ -439,28 +487,27 @@ public:
 		}
 
 		void TaskRunning(const PipelineTask &task, TaskExecutionMode mode) {
+			auto execution_thread_id = telemetry->ExecutionThreadId();
+			auto cpu_id = TaskScheduler::GetEstimatedCPUId();
+
 			lock_guard<mutex> guard(lock);
 			auto entry = tasks.find(std::cref(task));
 			if (entry == tasks.end()) {
 				return;
 			}
-			auto execution_thread_id = telemetry->ExecutionThreadId();
-			quent::pipeline_task::Running running;
-			running.instance_name = "";
-			running.mode = mode == TaskExecutionMode::PROCESS_PARTIAL ? "partial" : "all";
-			running.cpu_id = TaskScheduler::GetEstimatedCPUId();
-			running.execution_thread_resource_id = execution_thread_id;
-			entry->second.handle->running(std::move(running));
+			quent::pipeline_task::Running running {
+			    mode == TaskExecutionMode::PROCESS_PARTIAL ? "partial" : "all",
+			    cpu_id,
+			    {quent::execution_thread::ExecutionThreadId(execution_thread_id), {}}};
+			SetTaskRunning(entry->second.handle, std::move(running));
 		}
 
 		void TaskReady(const PipelineTask &task) {
 			lock_guard<mutex> guard(lock);
 			auto entry = tasks.find(std::cref(task));
 			if (entry != tasks.end()) {
-				quent::pipeline_task::Ready ready;
-				ready.queue_resource_id = telemetry->TaskQueueId();
-				ready.queue_capacity_entries = 1;
-				entry->second.handle->ready(std::move(ready));
+				quent::pipeline_task::Ready ready {{quent::task_queue::TaskQueueId(telemetry->TaskQueueId()), {1}}};
+				SetTaskReady(entry->second.handle, std::move(ready));
 			}
 		}
 
@@ -468,13 +515,13 @@ public:
 			lock_guard<mutex> guard(lock);
 			auto entry = tasks.find(std::cref(task));
 			if (entry != tasks.end()) {
-				entry->second.handle->blocked();
+				SetTaskBlocked(entry->second.handle);
 			}
 		}
 
 		void TaskFinished(const PipelineTask &task, TelemetryTaskOutcome outcome) {
-			optional<rust::Box<quent::pipeline_task::PipelineTaskHandle>> task_handle;
-			vector<rust::Box<quent::operator_invocation::OperatorInvocationHandle>> invocation_handles;
+			optional<TaskState> task_handle;
+			vector<InvocationRunning> invocation_handles;
 			{
 				lock_guard<mutex> guard(lock);
 				auto entry = tasks.find(std::cref(task));
@@ -493,59 +540,88 @@ public:
 				} catch (...) {
 				}
 			}
-			quent::pipeline_task::Finalizing finalizing;
-			finalizing.instance_name = "";
-			finalizing.success = outcome == TelemetryTaskOutcome::SUCCESS;
-			(*task_handle)->finalizing(std::move(finalizing));
-			(*task_handle)->exit();
+			CompleteTask(std::move(*task_handle), outcome);
 		}
 
 		void InvocationStarted(const PipelineExecutor &executor, const PhysicalOperator &op,
 		                       TelemetryOperatorPhase phase, optional_ptr<const DataChunk> input) {
-			lock_guard<mutex> guard(lock);
-			if (!query || !plan) {
-				return;
+			auto input_rows = input ? input->size() : 0;
+			auto input_logical_bytes = input ? input->GetDataSize() : 0;
+			optional<InvocationRunning> previous_handle;
+			quent::Uuid query_id;
+			quent::Uuid plan_id;
+			quent::Uuid operator_id;
+			std::optional<quent::Uuid> task_id;
+			uint64_t invocation_index;
+			{
+				lock_guard<mutex> guard(lock);
+				if (!query || !plan || !plan->FindOperator(op, operator_id)) {
+					return;
+				}
+
+				query_id = query->id().raw();
+				plan_id = plan->plan_id;
+				invocation_index = next_invocation_index++;
+				auto active = invocations.find(std::cref(executor));
+				if (active != invocations.end()) {
+					previous_handle.emplace(std::move(active->second.handle));
+					invocations.erase(active);
+				}
+
+				auto task_entry = executors.find(std::cref(executor));
+				if (task_entry != executors.end()) {
+					task_id = task_entry->second;
+				}
+			}
+			RemoveIoAttribution(this, executor);
+			if (previous_handle) {
+				try {
+					CompleteInvocation(std::move(*previous_handle), TelemetryTaskOutcome::FAILURE, nullptr);
+				} catch (...) {
+				}
 			}
 
-			uuid::UUID operator_id;
-			if (!plan->FindOperator(op, operator_id)) {
-				return;
+			std::optional<quent::pipeline_task::PipelineTaskId> task_ref;
+			if (task_id) {
+				task_ref = quent::pipeline_task::PipelineTaskId(*task_id);
 			}
+			quent::operator_invocation::InvocationCreated created {"operator-invocation-" +
+			                                                           std::to_string(invocation_index),
+			                                                       quent::query::QueryId(query_id),
+			                                                       quent::plan::PlanId(plan_id),
+			                                                       std::move(task_ref),
+			                                                       quent::operator_::OperatorId(operator_id),
+			                                                       OperatorPhaseName(phase)};
+			auto created_handle =
+			    std::move(telemetry->operator_invocation_observer->handle()).invocation_created(std::move(created));
+
 			auto execution_thread_id = telemetry->ExecutionThreadId();
-			auto active = invocations.find(std::cref(executor));
-			if (active != invocations.end()) {
-				FinishInvocation(executor, TelemetryTaskOutcome::FAILURE, nullptr);
+			quent::operator_invocation::InvocationRunning running {
+			    input_rows, input_logical_bytes, {quent::execution_thread::ExecutionThreadId(execution_thread_id), {}}};
+			auto handle = std::move(created_handle).invocation_running(std::move(running));
+			{
+				lock_guard<mutex> guard(lock);
+				bool task_active = !task_id;
+				auto task_entry = executors.find(std::cref(executor));
+				if (task_id && task_entry != executors.end()) {
+					task_active = task_entry->second == *task_id;
+				}
+				if (query && plan && query->id().raw() == query_id && plan->plan_id == plan_id && task_active &&
+				    invocations.find(std::cref(executor)) == invocations.end()) {
+					invocations.emplace(std::cref(executor),
+					                    InvocationTelemetry(std::move(handle), task_id, invocation_index));
+					CurrentIoAttribution(query_id);
+					PushIoAttribution(this, executor, query_id, plan_id, task_id, operator_id, invocation_index);
+					return;
+				}
 			}
-
-			auto task_id = uuid::new_nil();
-			auto task_entry = executors.find(std::cref(executor));
-			if (task_entry != executors.end()) {
-				task_id = task_entry->second;
-			}
-
-			quent::operator_invocation::InvocationCreated created;
-			created.instance_name = "operator-invocation-" + std::to_string(next_invocation_index++);
-			created.query_id = (*query)->uuid();
-			created.plan_id = plan->plan_id;
-			created.task_id = task_id;
-			created.operator_id = operator_id;
-			created.phase = OperatorPhaseName(phase);
-			auto handle = quent::operator_invocation::create(*telemetry->context, std::move(created));
-
-			quent::operator_invocation::InvocationRunning running;
-			running.instance_name = "";
-			running.input_rows = input ? input->size() : 0;
-			running.input_logical_bytes = input ? input->GetDataSize() : 0;
-			running.execution_thread_resource_id = execution_thread_id;
-			handle->invocation_running(std::move(running));
-			invocations.emplace(std::cref(executor), InvocationTelemetry(std::move(handle), task_id));
-			PushIoAttribution(executor, (*query)->uuid(), plan->plan_id, task_id, operator_id);
+			CompleteInvocation(std::move(handle), TelemetryTaskOutcome::FAILURE, nullptr);
 		}
 
 		void InvocationFinished(const PipelineExecutor &executor, const PhysicalOperator &,
 		                        optional_ptr<const DataChunk> output) {
-			RemoveIoAttribution(executor);
-			optional<rust::Box<quent::operator_invocation::OperatorInvocationHandle>> handle;
+			RemoveIoAttribution(this, executor);
+			optional<InvocationRunning> handle;
 			{
 				lock_guard<mutex> guard(lock);
 				auto entry = invocations.find(std::cref(executor));
@@ -560,12 +636,12 @@ public:
 
 		void EmitChunkTransfer(const PipelineExecutor &executor, const PhysicalOperator &source,
 		                       const PhysicalOperator &target, const DataChunk &chunk) {
-			uuid::UUID query_id;
-			uuid::UUID task_id = uuid::new_nil();
-			uuid::UUID source_operator_id;
-			uuid::UUID source_port_id;
-			uuid::UUID target_operator_id;
-			uuid::UUID target_port_id;
+			quent::Uuid query_id;
+			std::optional<quent::Uuid> task_id;
+			quent::Uuid source_operator_id;
+			quent::Uuid source_port_id;
+			quent::Uuid target_operator_id;
+			quent::Uuid target_port_id;
 			uint64_t transfer_index;
 			{
 				lock_guard<mutex> guard(lock);
@@ -574,7 +650,7 @@ public:
 				                    target_port_id)) {
 					return;
 				}
-				query_id = (*query)->uuid();
+				query_id = query->id().raw();
 				auto task_entry = executors.find(std::cref(executor));
 				if (task_entry != executors.end()) {
 					task_id = task_entry->second;
@@ -582,19 +658,23 @@ public:
 				transfer_index = next_transfer_index++;
 			}
 
-			quent::chunk_transfer::Produced produced;
-			produced.instance_name = "chunk-transfer-" + std::to_string(transfer_index);
-			produced.query_id = query_id;
-			produced.task_id = task_id;
-			produced.source_operator_id = source_operator_id;
-			produced.source_port_id = source_port_id;
-			produced.target_operator_id = target_operator_id;
-			produced.target_port_id = target_port_id;
-			produced.rows = chunk.size();
-			produced.logical_bytes = chunk.GetDataSize();
-			auto handle = quent::chunk_transfer::create(*telemetry->context, std::move(produced));
-			handle->published();
-			handle->exit();
+			std::optional<quent::pipeline_task::PipelineTaskId> task_ref;
+			if (task_id) {
+				task_ref = quent::pipeline_task::PipelineTaskId(*task_id);
+			}
+			quent::chunk_transfer::Produced produced {"chunk-transfer-" + std::to_string(transfer_index),
+			                                          quent::query::QueryId(query_id),
+			                                          std::move(task_ref),
+			                                          quent::operator_::OperatorId(source_operator_id),
+			                                          quent::port::PortId(source_port_id),
+			                                          quent::operator_::OperatorId(target_operator_id),
+			                                          quent::port::PortId(target_port_id),
+			                                          chunk.size(),
+			                                          chunk.GetDataSize()};
+			auto produced_handle =
+			    std::move(telemetry->chunk_transfer_observer->handle()).produced(std::move(produced));
+			auto published_handle = std::move(produced_handle).published();
+			std::move(published_handle).exit();
 		}
 
 		unique_ptr<TemporaryIoEvent> StartTempIo(const TemporaryIoInfo &info) {
@@ -603,67 +683,129 @@ public:
 				return nullptr;
 			}
 
-			auto query_id = (*query)->uuid();
-			auto task_id = uuid::new_nil();
-			auto operator_id = uuid::new_nil();
+			auto query_id = query->id().raw();
+			std::optional<quent::Uuid> task_id;
+			std::optional<quent::Uuid> operator_id;
 			auto attribution = CurrentIoAttribution(query_id);
 			if (attribution && attribution->plan_id == plan->plan_id) {
 				task_id = attribution->task_id;
 				operator_id = attribution->operator_id;
 			}
 
-			quent::temporary_block_io::IoRequested requested;
-			requested.instance_name = "temporary-block-io-" + std::to_string(next_temp_io_index++);
-			requested.query_id = query_id;
-			requested.plan_id = plan->plan_id;
-			requested.task_id = task_id;
-			requested.trigger_operator_id = operator_id;
-			requested.block_id = info.block_id;
-			requested.memory_tag = EnumUtil::ToString(info.tag);
-			requested.direction = IoDirectionName(info.direction);
-			auto handle = quent::temporary_block_io::create(*telemetry->context, std::move(requested));
+			std::optional<quent::pipeline_task::PipelineTaskId> task_ref;
+			if (task_id) {
+				task_ref = quent::pipeline_task::PipelineTaskId(*task_id);
+			}
+			std::optional<quent::operator_::OperatorId> operator_ref;
+			if (operator_id) {
+				operator_ref = quent::operator_::OperatorId(*operator_id);
+			}
+			quent::temporary_block_io::IoRequested requested {"temporary-block-io-" +
+			                                                      std::to_string(next_temp_io_index++),
+			                                                  quent::query::QueryId(query_id),
+			                                                  quent::plan::PlanId(plan->plan_id),
+			                                                  std::move(task_ref),
+			                                                  std::move(operator_ref),
+			                                                  info.block_id,
+			                                                  EnumUtil::ToString(info.tag),
+			                                                  IoDirectionName(info.direction)};
+			auto requested_handle =
+			    std::move(telemetry->temporary_block_io_observer->handle()).io_requested(std::move(requested));
 
-			quent::temporary_block_io::IoActive active;
-			active.channel_resource_id = telemetry->TemporaryIoChannelId(info.direction);
-			active.channel_capacity_operations = 1;
-			active.channel_capacity_buffer_bytes = info.buffer_bytes;
-			handle->io_active(std::move(active));
+			quent::temporary_block_io::IoActive active {
+			    {quent::temporary_io_channel::TemporaryIoChannelId(telemetry->TemporaryIoChannelId(info.direction)),
+			     {1, info.buffer_bytes}}};
+			auto handle = std::move(requested_handle).io_active(std::move(active));
 
 			return make_uniq<QuentTemporaryIoEvent>(std::move(handle));
 		}
 
 	private:
-		static void CompleteInvocation(rust::Box<quent::operator_invocation::OperatorInvocationHandle> handle,
-		                               TelemetryTaskOutcome outcome, optional_ptr<const DataChunk> output) {
+		bool InvocationActive(const PipelineExecutor *executor, uint64_t generation) const {
+			for (auto &entry : invocations) {
+				if (&entry.first.get() == executor && entry.second.generation == generation) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		optional<IoAttribution> CurrentIoAttribution(quent::Uuid query_id) const {
+			optional<IoAttribution> current;
+			for (idx_t index = active_io_attributions.size(); index > 0;) {
+				index--;
+				auto attribution = active_io_attributions[index];
+				if (attribution.owner != this) {
+					continue;
+				}
+				if (attribution.query_id != query_id ||
+				    !InvocationActive(attribution.executor, attribution.generation)) {
+					active_io_attributions.erase(active_io_attributions.begin() + index);
+					continue;
+				}
+				if (!current) {
+					current = attribution;
+				}
+			}
+			return current;
+		}
+
+		static void SetTaskRunning(TaskState &handle, quent::pipeline_task::Running running) {
+			if (auto created = std::get_if<TaskCreatedHandle>(&handle)) {
+				handle.emplace<TaskRunningHandle>(std::move(*created).running(std::move(running)));
+				return;
+			}
+			if (auto ready = std::get_if<TaskReadyHandle>(&handle)) {
+				handle.emplace<TaskRunningHandle>(std::move(*ready).running(std::move(running)));
+				return;
+			}
+			if (auto blocked = std::get_if<TaskBlockedHandle>(&handle)) {
+				handle.emplace<TaskRunningHandle>(std::move(*blocked).running(std::move(running)));
+			}
+		}
+
+		static void SetTaskReady(TaskState &handle, quent::pipeline_task::Ready ready) {
+			auto running = std::get_if<TaskRunningHandle>(&handle);
+			if (!running) {
+				return;
+			}
+			handle.emplace<TaskReadyHandle>(std::move(*running).ready(std::move(ready)));
+		}
+
+		static void SetTaskBlocked(TaskState &handle) {
+			auto running = std::get_if<TaskRunningHandle>(&handle);
+			if (!running) {
+				return;
+			}
+			handle.emplace<TaskBlockedHandle>(std::move(*running).blocked());
+		}
+
+		static void CompleteTask(TaskState handle, TelemetryTaskOutcome outcome) {
+			quent::pipeline_task::Finalizing finalizing;
+			finalizing.success = outcome == TelemetryTaskOutcome::SUCCESS;
+			auto finalizing_handle = std::visit(
+			    [&finalizing](auto &current) { return std::move(current).finalizing(std::move(finalizing)); }, handle);
+			std::move(finalizing_handle).exit();
+		}
+
+		static void CompleteInvocation(InvocationRunning handle, TelemetryTaskOutcome outcome,
+		                               optional_ptr<const DataChunk> output) {
 			quent::operator_invocation::InvocationCompleted completed;
-			completed.instance_name = "";
 			completed.success = outcome == TelemetryTaskOutcome::SUCCESS;
 			completed.output_rows = output ? output->size() : 0;
 			completed.output_logical_bytes = output ? output->GetDataSize() : 0;
-			handle->invocation_completed(std::move(completed));
-			handle->exit();
+			auto completed_handle = std::move(handle).invocation_completed(std::move(completed));
+			std::move(completed_handle).exit();
 		}
 
-		void FinishInvocation(const PipelineExecutor &executor, TelemetryTaskOutcome outcome,
-		                      optional_ptr<const DataChunk> output) {
-			RemoveIoAttribution(executor);
-			auto entry = invocations.find(std::cref(executor));
-			if (entry == invocations.end()) {
-				return;
-			}
-			auto handle = std::move(entry->second.handle);
-			invocations.erase(entry);
-			CompleteInvocation(std::move(handle), outcome, output);
-		}
-
-		vector<rust::Box<quent::operator_invocation::OperatorInvocationHandle>> TakeInvocations(uuid::UUID task_id) {
-			vector<rust::Box<quent::operator_invocation::OperatorInvocationHandle>> handles;
+		vector<InvocationRunning> TakeInvocations(quent::Uuid task_id) {
+			vector<InvocationRunning> handles;
 			for (auto entry = invocations.begin(); entry != invocations.end();) {
-				if (entry->second.task_id != task_id) {
+				if (!entry->second.task_id || *entry->second.task_id != task_id) {
 					entry++;
 					continue;
 				}
-				RemoveIoAttribution(entry->first.get());
+				RemoveIoAttribution(this, entry->first.get());
 				handles.push_back(std::move(entry->second.handle));
 				entry = invocations.erase(entry);
 			}
@@ -671,10 +813,10 @@ public:
 		}
 
 		void FinishInvocations() {
-			vector<rust::Box<quent::operator_invocation::OperatorInvocationHandle>> handles;
+			vector<InvocationRunning> handles;
 			handles.reserve(invocations.size());
 			for (auto &entry : invocations) {
-				RemoveIoAttribution(entry.first.get());
+				RemoveIoAttribution(this, entry.first.get());
 				handles.push_back(std::move(entry.second.handle));
 			}
 			invocations.clear();
@@ -686,7 +828,7 @@ public:
 			}
 		}
 
-		void EraseExecutors(uuid::UUID task_id) {
+		void EraseExecutors(quent::Uuid task_id) {
 			for (auto entry = executors.begin(); entry != executors.end();) {
 				if (entry->second == task_id) {
 					entry = executors.erase(entry);
@@ -698,7 +840,7 @@ public:
 
 		void FinishTasks() {
 			FinishInvocations();
-			vector<rust::Box<quent::pipeline_task::PipelineTaskHandle>> handles;
+			vector<TaskState> handles;
 			handles.reserve(tasks.size());
 			for (auto &entry : tasks) {
 				handles.push_back(std::move(entry.second.handle));
@@ -707,11 +849,7 @@ public:
 			executors.clear();
 			for (auto &handle : handles) {
 				try {
-					quent::pipeline_task::Finalizing finalizing;
-					finalizing.instance_name = "";
-					finalizing.success = false;
-					handle->finalizing(std::move(finalizing));
-					handle->exit();
+					CompleteTask(std::move(handle), TelemetryTaskOutcome::FAILURE);
 				} catch (...) {
 				}
 			}
@@ -728,18 +866,18 @@ public:
 			auto handle = std::move(*query);
 			query.reset();
 			try {
-				handle->exit();
+				std::move(handle).exit();
 			} catch (...) {
 			}
 		}
 
 	private:
 		shared_ptr<Impl> telemetry;
-		uuid::UUID query_group_id;
-		optional<rust::Box<quent::query::QueryHandle>> query;
+		quent::Uuid query_group_id;
+		optional<QueryExecuting> query;
 		unique_ptr<RuntimePlan> plan;
 		reference_map_t<const PipelineTask, TaskTelemetry> tasks;
-		reference_map_t<const PipelineExecutor, uuid::UUID> executors;
+		reference_map_t<const PipelineExecutor, quent::Uuid> executors;
 		reference_map_t<const PipelineExecutor, InvocationTelemetry> invocations;
 		optional<string> query_text;
 		mutex lock;
@@ -753,16 +891,19 @@ public:
 	class TempIoProbe final : public TemporaryIoProbe {
 	public:
 		unique_ptr<TemporaryIoEvent> Start(const TemporaryIoInfo &info) override {
-			auto context = info.context.GetClientContext();
-			if (!context) {
-				return nullptr;
-			}
+			try {
+				auto context = info.context.GetClientContext();
+				if (!context) {
+					return nullptr;
+				}
 
-			auto state = context->registered_state->Get<ClientState>(TELEMETRY_STATE_NAME);
-			if (!state) {
-				return nullptr;
+				auto state = context->registered_state->Get<ClientState>(TELEMETRY_STATE_NAME);
+				if (state) {
+					return state->StartTempIo(info);
+				}
+			} catch (...) {
 			}
-			return state->StartTempIo(info);
+			return nullptr;
 		}
 	};
 
@@ -829,29 +970,36 @@ public:
 		weak_ptr<Impl> telemetry;
 	};
 
-	Impl(rust::Box<quent::ExporterOptions> exporter, const string &instance_name, MemoryTelemetryMode memory_mode)
-	    : engine_id(uuid::now_v7()), worker_id(uuid::now_v7()), context(quent::create_context(std::move(exporter))),
-	      engine_observer(quent::engine::create_observer(*context)),
-	      worker_observer(quent::worker::create_observer(*context)),
-	      query_group_observer(quent::query_group::create_observer(*context)) {
+	Impl(quent::Context context_p, const string &instance_name, MemoryTelemetryMode memory_mode)
+	    : engine_id(quent::now_v7()), worker_id(quent::now_v7()), context(std::move(context_p)),
+	      engine_observer(context.engine_observer()), worker_observer(context.worker_observer()),
+	      query_group_observer(context.query_group_observer()), plan_observer(context.plan_observer()),
+	      operator_observer(context.operator_observer()), port_observer(context.port_observer()),
+	      query_observer(context.query_observer()), pipeline_task_observer(context.pipeline_task_observer()),
+	      chunk_transfer_observer(context.chunk_transfer_observer()),
+	      operator_invocation_observer(context.operator_invocation_observer()),
+	      temporary_block_io_observer(context.temporary_block_io_observer()),
+	      memory_account_observer(context.memory_account_observer()),
+	      execution_thread_observer(context.execution_thread_observer()),
+	      task_queue_observer(context.task_queue_observer()),
+	      temporary_io_channel_observer(context.temporary_io_channel_observer()),
+	      buffer_pool_memory_observer(context.buffer_pool_memory_observer()),
+	      temporary_storage_observer(context.temporary_storage_observer()),
+	      temporary_directory_storage_observer(context.temporary_directory_storage_observer()),
+	      engine_handle(engine_observer->handle(quent::engine::EngineId(engine_id))),
+	      worker_handle(worker_observer->handle(quent::worker::WorkerId(worker_id))) {
 		quent::engine::Init engine_init;
 		engine_init.implementation.name = "DuckDB";
 		engine_init.implementation.version = DuckDB::LibraryVersion();
 		engine_init.instance_name = instance_name;
-		engine_observer->init(engine_id, std::move(engine_init));
+		engine_handle.init(std::move(engine_init));
 
-		quent::worker::Init worker_init;
-		worker_init.parent_engine_id = engine_id;
-		worker_init.instance_name = "local";
-		worker_observer->init(worker_id, std::move(worker_init));
+		quent::worker::Init worker_init {quent::engine::EngineId(engine_id), "local"};
+		worker_handle.init(std::move(worker_init));
 
-		quent::task_queue::Initializing queue_init;
-		queue_init.instance_name = "runnable-pipeline-tasks";
-		queue_init.parent_group_id = worker_id;
-		task_queue.emplace(quent::task_queue::create(*context, std::move(queue_init)));
-		quent::task_queue::Operating operating;
-		operating.capacity_entries = NumericLimits<uint64_t>::Maximum();
-		(*task_queue)->operating(std::move(operating));
+		quent::task_queue::Initializing queue_init {"runnable-pipeline-tasks", quent::worker::WorkerId(worker_id)};
+		auto queue_initializing = std::move(task_queue_observer->handle()).initializing(std::move(queue_init));
+		task_queue.emplace(std::move(queue_initializing).operating());
 
 		temp_spill_channel.emplace(CreateIoChannel(TEMP_SPILL_NAME));
 		temp_reload_channel.emplace(CreateIoChannel(TEMP_RELOAD_NAME));
@@ -864,7 +1012,7 @@ public:
 		Exit();
 	}
 
-	void Exit() {
+	void Exit() noexcept {
 		{
 			lock_guard<mutex> guard(resource_lock);
 			if (exited) {
@@ -873,13 +1021,21 @@ public:
 			exited = true;
 
 			for (auto &entry : execution_threads) {
-				entry.second->finalizing();
-				entry.second->exit();
+				try {
+					auto finalizing = std::move(entry.second).finalizing();
+					std::move(finalizing).exit();
+				} catch (...) {
+				}
 			}
 			execution_threads.clear();
 			if (task_queue) {
-				(*task_queue)->finalizing();
-				(*task_queue)->exit();
+				try {
+					auto handle = std::move(*task_queue);
+					task_queue.reset();
+					auto finalizing = std::move(handle).finalizing();
+					std::move(finalizing).exit();
+				} catch (...) {
+				}
 				task_queue.reset();
 			}
 			auto exit_channel = [](auto &channel) {
@@ -887,49 +1043,68 @@ public:
 					return;
 				}
 
-				(*channel)->finalizing();
-				(*channel)->exit();
-				channel.reset();
+				try {
+					auto handle = std::move(*channel);
+					channel.reset();
+					auto finalizing = std::move(handle).finalizing();
+					std::move(finalizing).exit();
+				} catch (...) {
+					channel.reset();
+				}
 			};
 			exit_channel(temp_spill_channel);
 			exit_channel(temp_reload_channel);
 			ExitMemoryResources();
 		}
-		worker_observer->exit(worker_id);
-		engine_observer->exit(engine_id);
+		try {
+			worker_handle.exit();
+		} catch (...) {
+		}
+		try {
+			engine_handle.exit();
+		} catch (...) {
+		}
 	}
 
-	uuid::UUID TaskQueueId() const {
+	quent::Uuid TaskQueueId() const {
 		D_ASSERT(task_queue);
-		return (*task_queue)->uuid();
+		return task_queue->id().raw();
 	}
 
-	uuid::UUID ExecutionThreadId() {
+	quent::Uuid ExecutionThreadId() {
+		for (auto &cached : execution_thread_cache) {
+			if (cached.owner == this && cached.engine_id == engine_id) {
+				return cached.thread_id;
+			}
+		}
+
 		auto thread_name = ThreadUtil::GetThreadIdString();
 		lock_guard<mutex> guard(resource_lock);
 		auto entry = execution_threads.find(thread_name);
 		if (entry != execution_threads.end()) {
-			return entry->second->uuid();
+			auto id = entry->second.id().raw();
+			execution_thread_cache.push_back({this, engine_id, id});
+			return id;
 		}
 
-		quent::execution_thread::Initializing initializing;
-		initializing.instance_name = "thread-" + thread_name;
-		initializing.parent_group_id = worker_id;
-		auto handle = quent::execution_thread::create(*context, std::move(initializing));
-		handle->operating();
-		auto id = handle->uuid();
+		quent::execution_thread::Initializing initializing {"thread-" + thread_name,
+		                                                    quent::worker::WorkerId(worker_id)};
+		auto initializing_handle = std::move(execution_thread_observer->handle()).initializing(std::move(initializing));
+		auto handle = std::move(initializing_handle).operating();
+		auto id = handle.id().raw();
 		execution_threads.emplace(std::move(thread_name), std::move(handle));
+		execution_thread_cache.push_back({this, engine_id, id});
 		return id;
 	}
 
-	uuid::UUID TemporaryIoChannelId(TemporaryIoDirection direction) const {
+	quent::Uuid TemporaryIoChannelId(TemporaryIoDirection direction) const {
 		switch (direction) {
 		case TemporaryIoDirection::SPILL:
 			D_ASSERT(temp_spill_channel);
-			return (*temp_spill_channel)->uuid();
+			return temp_spill_channel->id().raw();
 		case TemporaryIoDirection::RELOAD:
 			D_ASSERT(temp_reload_channel);
-			return (*temp_reload_channel)->uuid();
+			return temp_reload_channel->id().raw();
 		}
 		throw InternalException("Unknown temporary I/O direction");
 	}
@@ -939,24 +1114,17 @@ private:
 		return buffer_pool_memory.has_value();
 	}
 
-	rust::Box<quent::temporary_io_channel::TemporaryIoChannelHandle> CreateIoChannel(const char *name) {
-		quent::temporary_io_channel::Initializing initializing;
-		initializing.instance_name = name;
-		initializing.parent_group_id = worker_id;
-		auto handle = quent::temporary_io_channel::create(*context, std::move(initializing));
-
-		quent::temporary_io_channel::Operating operating;
-		operating.capacity_operations = NumericLimits<uint64_t>::Maximum();
-		operating.capacity_buffer_bytes = NumericLimits<uint64_t>::Maximum();
-		handle->operating(std::move(operating));
-		return handle;
+	IoChannelOperating CreateIoChannel(const char *name) {
+		quent::temporary_io_channel::Initializing initializing {name, quent::worker::WorkerId(worker_id)};
+		auto handle = std::move(temporary_io_channel_observer->handle()).initializing(std::move(initializing));
+		return std::move(handle).operating();
 	}
 
 	void InitializeMemoryResources();
 	void UpdateBufferAccount(MemoryTag tag);
 	void UpdateTempAccount(MemoryTag tag);
 	void UpdateDirectoryAccount();
-	void ExitMemoryResources();
+	void ExitMemoryResources() noexcept;
 	void SetBufferPoolUsage(MemoryTag tag, idx_t bytes);
 	void ChangeBufferPoolUsage(MemoryTag tag, int64_t bytes);
 	void ResizeBufferPool(idx_t bytes);
@@ -966,78 +1134,103 @@ private:
 	static void ApplyDelta(uint64_t &current, int64_t delta) noexcept;
 
 private:
-	uuid::UUID engine_id;
-	uuid::UUID worker_id;
-	rust::Box<quent::Context> context;
-	rust::Box<quent::engine::EngineObserver> engine_observer;
-	rust::Box<quent::worker::WorkerObserver> worker_observer;
-	rust::Box<quent::query_group::QueryGroupObserver> query_group_observer;
-	optional<rust::Box<quent::task_queue::TaskQueueHandle>> task_queue;
-	optional<rust::Box<quent::temporary_io_channel::TemporaryIoChannelHandle>> temp_spill_channel;
-	optional<rust::Box<quent::temporary_io_channel::TemporaryIoChannelHandle>> temp_reload_channel;
-	optional<rust::Box<quent::buffer_pool_memory::BufferPoolMemoryHandle>> buffer_pool_memory;
-	optional<rust::Box<quent::temporary_storage::TemporaryStorageHandle>> temporary_storage;
-	optional<rust::Box<quent::temporary_directory_storage::TemporaryDirectoryStorageHandle>>
-	    temporary_directory_storage;
+	quent::Uuid engine_id;
+	quent::Uuid worker_id;
+	quent::Context context;
+	std::shared_ptr<quent::engine::EngineObserver> engine_observer;
+	std::shared_ptr<quent::worker::WorkerObserver> worker_observer;
+	std::shared_ptr<quent::query_group::QueryGroupObserver> query_group_observer;
+	std::shared_ptr<quent::plan::PlanObserver> plan_observer;
+	std::shared_ptr<quent::operator_::OperatorObserver> operator_observer;
+	std::shared_ptr<quent::port::PortObserver> port_observer;
+	std::shared_ptr<quent::query::QueryObserver> query_observer;
+	std::shared_ptr<quent::pipeline_task::PipelineTaskObserver> pipeline_task_observer;
+	std::shared_ptr<quent::chunk_transfer::ChunkTransferObserver> chunk_transfer_observer;
+	std::shared_ptr<quent::operator_invocation::OperatorInvocationObserver> operator_invocation_observer;
+	std::shared_ptr<quent::temporary_block_io::TemporaryBlockIoObserver> temporary_block_io_observer;
+	std::shared_ptr<quent::memory_account::MemoryAccountObserver> memory_account_observer;
+	std::shared_ptr<quent::execution_thread::ExecutionThreadObserver> execution_thread_observer;
+	std::shared_ptr<quent::task_queue::TaskQueueObserver> task_queue_observer;
+	std::shared_ptr<quent::temporary_io_channel::TemporaryIoChannelObserver> temporary_io_channel_observer;
+	std::shared_ptr<quent::buffer_pool_memory::BufferPoolMemoryObserver> buffer_pool_memory_observer;
+	std::shared_ptr<quent::temporary_storage::TemporaryStorageObserver> temporary_storage_observer;
+	std::shared_ptr<quent::temporary_directory_storage::TemporaryDirectoryStorageObserver>
+	    temporary_directory_storage_observer;
+	quent::Handle<quent::Engine> engine_handle;
+	quent::Handle<quent::Worker> worker_handle;
+	optional<QueueOperating> task_queue;
+	optional<IoChannelOperating> temp_spill_channel;
+	optional<IoChannelOperating> temp_reload_channel;
+	optional<BufferPoolOperating> buffer_pool_memory;
+	optional<TempStorageOperating> temporary_storage;
+	optional<TempDirectoryOperating> temporary_directory_storage;
 	array<MemoryAccountTelemetry, MEMORY_TAG_COUNT> buffer_pool_accounts;
 	array<MemoryAccountTelemetry, MEMORY_TAG_COUNT> temporary_storage_accounts;
 	MemoryAccountTelemetry temporary_directory_account;
-	unordered_map<string, rust::Box<quent::execution_thread::ExecutionThreadHandle>> execution_threads;
+	unordered_map<string, ThreadOperating> execution_threads;
 	mutex resource_lock;
 	bool exited = false;
 };
 
 void TelemetryContext::Impl::InitializeMemoryResources() {
-	quent::buffer_pool_memory::Initializing buffer_pool_initializing;
-	buffer_pool_initializing.instance_name = BUFFER_POOL_MEMORY_NAME;
-	buffer_pool_initializing.parent_group_id = engine_id;
-	buffer_pool_memory.emplace(quent::buffer_pool_memory::create(*context, std::move(buffer_pool_initializing)));
+	quent::buffer_pool_memory::Initializing buffer_pool_initializing {BUFFER_POOL_MEMORY_NAME,
+	                                                                  quent::engine::EngineId(engine_id)};
+	auto buffer_pool_handle =
+	    std::move(buffer_pool_memory_observer->handle()).initializing(std::move(buffer_pool_initializing));
 	quent::buffer_pool_memory::Operating buffer_pool_operating;
-	buffer_pool_operating.capacity_bytes = NumericLimits<uint64_t>::Maximum();
-	(*buffer_pool_memory)->operating(std::move(buffer_pool_operating));
+	buffer_pool_operating.limits.bytes = NumericLimits<uint64_t>::Maximum();
+	buffer_pool_memory.emplace(std::move(buffer_pool_handle).operating(std::move(buffer_pool_operating)));
 
-	quent::temporary_storage::Initializing temporary_storage_initializing;
-	temporary_storage_initializing.instance_name = TEMP_STORAGE_NAME;
-	temporary_storage_initializing.parent_group_id = engine_id;
-	temporary_storage.emplace(quent::temporary_storage::create(*context, std::move(temporary_storage_initializing)));
+	quent::temporary_storage::Initializing temporary_storage_initializing {TEMP_STORAGE_NAME,
+	                                                                       quent::engine::EngineId(engine_id)};
+	auto temporary_storage_handle =
+	    std::move(temporary_storage_observer->handle()).initializing(std::move(temporary_storage_initializing));
 	quent::temporary_storage::Operating temporary_storage_operating;
-	temporary_storage_operating.capacity_bytes = NumericLimits<uint64_t>::Maximum();
-	(*temporary_storage)->operating(std::move(temporary_storage_operating));
+	temporary_storage_operating.limits.bytes = NumericLimits<uint64_t>::Maximum();
+	temporary_storage.emplace(std::move(temporary_storage_handle).operating(std::move(temporary_storage_operating)));
 
-	quent::temporary_directory_storage::Initializing temporary_directory_initializing;
-	temporary_directory_initializing.instance_name = TEMP_DIRECTORY_STORAGE_NAME;
-	temporary_directory_initializing.parent_group_id = engine_id;
-	temporary_directory_storage.emplace(
-	    quent::temporary_directory_storage::create(*context, std::move(temporary_directory_initializing)));
+	quent::temporary_directory_storage::Initializing temporary_directory_initializing {
+	    TEMP_DIRECTORY_STORAGE_NAME, quent::engine::EngineId(engine_id)};
+	auto temporary_directory_handle = std::move(temporary_directory_storage_observer->handle())
+	                                      .initializing(std::move(temporary_directory_initializing));
 	quent::temporary_directory_storage::Operating temporary_directory_operating;
-	temporary_directory_operating.capacity_bytes = NumericLimits<uint64_t>::Maximum();
-	(*temporary_directory_storage)->operating(std::move(temporary_directory_operating));
+	temporary_directory_operating.limits.bytes = NumericLimits<uint64_t>::Maximum();
+	temporary_directory_storage.emplace(
+	    std::move(temporary_directory_handle).operating(std::move(temporary_directory_operating)));
 
 	for (idx_t tag_index = 0; tag_index < MEMORY_TAG_COUNT; tag_index++) {
 		auto tag = MemoryTag(tag_index);
 		auto tag_name = EnumUtil::ToString(tag);
 
-		quent::memory_account::AccountRegistered buffer_registered;
-		buffer_registered.instance_name = string(BUFFER_POOL_MEMORY_NAME) + "-" + tag_name;
-		buffer_registered.memory_tag = tag_name;
+		quent::memory_account::AccountRegistered buffer_registered {string(BUFFER_POOL_MEMORY_NAME) + "-" + tag_name,
+		                                                            quent::engine::EngineId(engine_id), tag_name};
+		auto buffer_account =
+		    std::move(memory_account_observer->handle()).account_registered(std::move(buffer_registered));
+		quent::memory_account::Accounted buffer_accounted;
+		buffer_accounted.buffer_pool = quent::refs::BufferPoolMemoryUsageRef {
+		    quent::buffer_pool_memory::BufferPoolMemoryId(buffer_pool_memory->id().raw()), {0}};
 		buffer_pool_accounts[tag_index].handle.emplace(
-		    quent::memory_account::create(*context, std::move(buffer_registered)));
-		UpdateBufferAccount(tag);
+		    std::move(buffer_account).accounted(std::move(buffer_accounted)));
 
-		quent::memory_account::AccountRegistered temporary_registered;
-		temporary_registered.instance_name = string(TEMP_STORAGE_NAME) + "-" + tag_name;
-		temporary_registered.memory_tag = tag_name;
+		quent::memory_account::AccountRegistered temporary_registered {string(TEMP_STORAGE_NAME) + "-" + tag_name,
+		                                                               quent::engine::EngineId(engine_id), tag_name};
+		auto temporary_account =
+		    std::move(memory_account_observer->handle()).account_registered(std::move(temporary_registered));
+		quent::memory_account::Accounted temporary_accounted;
+		temporary_accounted.temporary_storage = quent::refs::TemporaryStorageUsageRef {
+		    quent::temporary_storage::TemporaryStorageId(temporary_storage->id().raw()), {0}};
 		temporary_storage_accounts[tag_index].handle.emplace(
-		    quent::memory_account::create(*context, std::move(temporary_registered)));
-		UpdateTempAccount(tag);
+		    std::move(temporary_account).accounted(std::move(temporary_accounted)));
 	}
 
-	quent::memory_account::AccountRegistered directory_registered;
-	directory_registered.instance_name = TEMP_DIRECTORY_ACCOUNT_NAME;
-	directory_registered.memory_tag = TEMP_DIRECTORY_ACCOUNT_TAG;
-	temporary_directory_account.handle.emplace(
-	    quent::memory_account::create(*context, std::move(directory_registered)));
-	UpdateDirectoryAccount();
+	quent::memory_account::AccountRegistered directory_registered {
+	    TEMP_DIRECTORY_ACCOUNT_NAME, quent::engine::EngineId(engine_id), TEMP_DIRECTORY_ACCOUNT_TAG};
+	auto directory_account =
+	    std::move(memory_account_observer->handle()).account_registered(std::move(directory_registered));
+	quent::memory_account::Accounted directory_accounted;
+	directory_accounted.temporary_directory = quent::refs::TemporaryDirectoryStorageUsageRef {
+	    quent::temporary_directory_storage::TemporaryDirectoryStorageId(temporary_directory_storage->id().raw()), {0}};
+	temporary_directory_account.handle.emplace(std::move(directory_account).accounted(std::move(directory_accounted)));
 }
 
 void TelemetryContext::Impl::UpdateBufferAccount(MemoryTag tag) {
@@ -1046,11 +1239,11 @@ void TelemetryContext::Impl::UpdateBufferAccount(MemoryTag tag) {
 	D_ASSERT(buffer_pool_memory);
 
 	quent::memory_account::Accounted accounted;
-	accounted.buffer_pool_resource_id = (*buffer_pool_memory)->uuid();
-	accounted.buffer_pool_capacity_bytes = account.bytes;
-	accounted.temporary_storage_resource_id = uuid::new_nil();
-	accounted.temporary_directory_resource_id = uuid::new_nil();
-	(*account.handle)->accounted(std::move(accounted));
+	accounted.buffer_pool = quent::refs::BufferPoolMemoryUsageRef {
+	    quent::buffer_pool_memory::BufferPoolMemoryId(buffer_pool_memory->id().raw()), {account.bytes}};
+	auto handle = std::move(*account.handle);
+	account.handle.reset();
+	account.handle.emplace(std::move(handle).accounted(std::move(accounted)));
 }
 
 void TelemetryContext::Impl::UpdateTempAccount(MemoryTag tag) {
@@ -1059,11 +1252,11 @@ void TelemetryContext::Impl::UpdateTempAccount(MemoryTag tag) {
 	D_ASSERT(temporary_storage);
 
 	quent::memory_account::Accounted accounted;
-	accounted.buffer_pool_resource_id = uuid::new_nil();
-	accounted.temporary_storage_resource_id = (*temporary_storage)->uuid();
-	accounted.temporary_storage_capacity_bytes = account.bytes;
-	accounted.temporary_directory_resource_id = uuid::new_nil();
-	(*account.handle)->accounted(std::move(accounted));
+	accounted.temporary_storage = quent::refs::TemporaryStorageUsageRef {
+	    quent::temporary_storage::TemporaryStorageId(temporary_storage->id().raw()), {account.bytes}};
+	auto handle = std::move(*account.handle);
+	account.handle.reset();
+	account.handle.emplace(std::move(handle).accounted(std::move(accounted)));
 }
 
 void TelemetryContext::Impl::UpdateDirectoryAccount() {
@@ -1071,11 +1264,12 @@ void TelemetryContext::Impl::UpdateDirectoryAccount() {
 	D_ASSERT(temporary_directory_storage);
 
 	quent::memory_account::Accounted accounted;
-	accounted.buffer_pool_resource_id = uuid::new_nil();
-	accounted.temporary_storage_resource_id = uuid::new_nil();
-	accounted.temporary_directory_resource_id = (*temporary_directory_storage)->uuid();
-	accounted.temporary_directory_capacity_bytes = temporary_directory_account.bytes;
-	(*temporary_directory_account.handle)->accounted(std::move(accounted));
+	accounted.temporary_directory = quent::refs::TemporaryDirectoryStorageUsageRef {
+	    quent::temporary_directory_storage::TemporaryDirectoryStorageId(temporary_directory_storage->id().raw()),
+	    {temporary_directory_account.bytes}};
+	auto handle = std::move(*temporary_directory_account.handle);
+	temporary_directory_account.handle.reset();
+	temporary_directory_account.handle.emplace(std::move(handle).accounted(std::move(accounted)));
 }
 
 void TelemetryContext::Impl::SetBufferPoolUsage(MemoryTag tag, idx_t bytes) {
@@ -1105,10 +1299,12 @@ void TelemetryContext::Impl::ResizeBufferPool(idx_t bytes) {
 		return;
 	}
 
-	(*buffer_pool_memory)->resizing();
+	auto handle = std::move(*buffer_pool_memory);
+	buffer_pool_memory.reset();
+	auto resizing = std::move(handle).resizing();
 	quent::buffer_pool_memory::Operating operating;
-	operating.capacity_bytes = bytes;
-	(*buffer_pool_memory)->operating(std::move(operating));
+	operating.limits.bytes = bytes;
+	buffer_pool_memory.emplace(std::move(resizing).operating(std::move(operating)));
 }
 
 void TelemetryContext::Impl::ChangeTempStorage(MemoryTag tag, int64_t bytes) {
@@ -1129,15 +1325,19 @@ void TelemetryContext::Impl::ResizeTempStorage(optional_idx bytes) {
 	}
 
 	auto capacity = bytes.IsValid() ? bytes.GetIndex() : NumericLimits<uint64_t>::Maximum();
-	(*temporary_storage)->resizing();
+	auto temporary_handle = std::move(*temporary_storage);
+	temporary_storage.reset();
+	auto temporary_resizing = std::move(temporary_handle).resizing();
 	quent::temporary_storage::Operating temporary_operating;
-	temporary_operating.capacity_bytes = capacity;
-	(*temporary_storage)->operating(std::move(temporary_operating));
+	temporary_operating.limits.bytes = capacity;
+	temporary_storage.emplace(std::move(temporary_resizing).operating(std::move(temporary_operating)));
 
-	(*temporary_directory_storage)->resizing();
+	auto directory_handle = std::move(*temporary_directory_storage);
+	temporary_directory_storage.reset();
+	auto directory_resizing = std::move(directory_handle).resizing();
 	quent::temporary_directory_storage::Operating directory_operating;
-	directory_operating.capacity_bytes = capacity;
-	(*temporary_directory_storage)->operating(std::move(directory_operating));
+	directory_operating.limits.bytes = capacity;
+	temporary_directory_storage.emplace(std::move(directory_resizing).operating(std::move(directory_operating)));
 }
 
 void TelemetryContext::Impl::ChangeTempDirectory(int64_t bytes) {
@@ -1161,14 +1361,19 @@ void TelemetryContext::Impl::ApplyDelta(uint64_t &current, int64_t delta) noexce
 	current = current >= decrease ? current - decrease : 0;
 }
 
-void TelemetryContext::Impl::ExitMemoryResources() {
+void TelemetryContext::Impl::ExitMemoryResources() noexcept {
 	auto exit_account = [](auto &account) {
 		if (!account.handle) {
 			return;
 		}
 
-		(*account.handle)->exit();
-		account.handle.reset();
+		try {
+			auto handle = std::move(*account.handle);
+			account.handle.reset();
+			std::move(handle).exit();
+		} catch (...) {
+			account.handle.reset();
+		}
 	};
 	for (auto &account : buffer_pool_accounts) {
 		exit_account(account);
@@ -1183,9 +1388,14 @@ void TelemetryContext::Impl::ExitMemoryResources() {
 			return;
 		}
 
-		(*resource)->finalizing();
-		(*resource)->exit();
-		resource.reset();
+		try {
+			auto handle = std::move(*resource);
+			resource.reset();
+			auto finalizing = std::move(handle).finalizing();
+			std::move(finalizing).exit();
+		} catch (...) {
+			resource.reset();
+		}
 	};
 	exit_resource(buffer_pool_memory);
 	exit_resource(temporary_storage);
@@ -1199,7 +1409,10 @@ TelemetryContext::TelemetryContext(DBConfig &config) {
 	}
 	auto instance_name = config.options.database_path.empty() ? string(":memory:") : config.options.database_path;
 	auto memory_mode = config.buffer_manager ? MemoryTelemetryMode::DISABLED : MemoryTelemetryMode::ENABLED;
-	impl = make_shared_ptr<Impl>(CreateExporter(exporter), instance_name, memory_mode);
+	try {
+		impl = make_shared_ptr<Impl>(CreateContext(exporter), instance_name, memory_mode);
+	} catch (...) {
+	}
 }
 
 TelemetryContext::~TelemetryContext() {
@@ -1209,8 +1422,11 @@ TelemetryContext::~TelemetryContext() {
 }
 
 void TelemetryContext::Initialize(ClientContext &context) {
-	if (impl) {
-		context.registered_state->Insert(TELEMETRY_STATE_NAME, make_shared_ptr<Impl::ClientState>(impl));
+	try {
+		if (impl) {
+			context.registered_state->Insert(TELEMETRY_STATE_NAME, make_shared_ptr<Impl::ClientState>(impl));
+		}
+	} catch (...) {
 	}
 }
 
@@ -1229,9 +1445,12 @@ shared_ptr<duckdb::MemoryUsageProbe> TelemetryContext::MemoryUsageProbe() {
 }
 
 void TelemetryContext::StartExecution(ClientContext &context, const PhysicalOperator &root) {
-	auto state = context.registered_state->Get<Impl::ClientState>(TELEMETRY_STATE_NAME);
-	if (state) {
-		state->StartExecution(root);
+	try {
+		auto state = context.registered_state->Get<Impl::ClientState>(TELEMETRY_STATE_NAME);
+		if (state) {
+			state->StartExecution(root);
+		}
+	} catch (...) {
 	}
 }
 

@@ -1,20 +1,111 @@
-use std::collections::{HashMap, HashSet};
-
-use duckdb_telemetry_model::operator_invocation::OperatorInvocationTransition;
+use duckdb_telemetry_store::OperatorInvocationEvent;
 use quent_analyzer::{
-    fsm::events::{FsmEvents, FsmEventsBuilder},
-    resource::collection::InMemoryResources,
+    AnalyzerResult, Entity,
+    fsm::{
+        Fsm, FsmUsages,
+        native::{AnalyzedFsm, AnalyzedFsmBuilder, AnalyzedTransition},
+    },
+    resource::{Usage, Using},
 };
 use quent_query_engine_ui::OperatorFilter;
-use quent_time::{Timestamp, span::SpanUnixNanoSec};
+use quent_time::{TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec};
+use quent_ui::fsm::{FsmStateTypeDecl, FsmTransitionDecl, FsmTypeDecl, FsmTypeDeclaration};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use uuid::Uuid;
 
-pub type OperatorInvocation = FsmEvents<OperatorInvocationTransition>;
-pub type OperatorInvocationBuilder = FsmEventsBuilder<OperatorInvocationTransition>;
+use crate::model::DuckDbModel;
+
+pub type OperatorInvocationBuilder = AnalyzedFsmBuilder<OperatorInvocationEvent>;
+
+#[derive(Debug)]
+pub struct OperatorInvocation(AnalyzedFsm<OperatorInvocationEvent>);
+
+impl OperatorInvocation {
+    pub(crate) fn try_from_builder(builder: OperatorInvocationBuilder) -> AnalyzerResult<Self> {
+        Ok(Self(builder.try_build()?))
+    }
+    pub(crate) fn transitions(&self) -> &[AnalyzedTransition<OperatorInvocationEvent>] {
+        self.0.transitions()
+    }
+    fn first_data(&self) -> Option<&OperatorInvocationEvent> {
+        self.0.transition(0).map(|transition| &transition.data)
+    }
+}
+
+impl Entity for OperatorInvocation {
+    fn id(&self) -> Uuid {
+        self.0.id()
+    }
+    fn type_name(&self) -> &str {
+        "operator_invocation"
+    }
+    fn earliest_timestamp(&self) -> TimeUnixNanoSec {
+        self.0.earliest_timestamp()
+    }
+    fn latest_timestamp(&self) -> TimeUnixNanoSec {
+        self.0.latest_timestamp()
+    }
+}
+
+impl Fsm for OperatorInvocation {
+    type TransitionType = AnalyzedTransition<OperatorInvocationEvent>;
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn transition(&self, index: usize) -> Option<&Self::TransitionType> {
+        self.0.transition(index)
+    }
+}
+
+impl<'a> FsmUsages<'a> for OperatorInvocation {
+    fn usages_with_state_names(&'a self) -> impl Iterator<Item = (&'a str, impl Usage<'a>)> {
+        self.0.usages_with_state_names()
+    }
+}
+
+impl Using for OperatorInvocation {
+    fn usages(&self) -> impl Iterator<Item = impl Usage<'_>> {
+        self.0.usages()
+    }
+}
+
+impl FsmTypeDeclaration for OperatorInvocation {
+    fn fsm_type_declaration() -> FsmTypeDecl {
+        let state = |name: &str, usages: &[&str]| FsmStateTypeDecl {
+            name: name.to_owned(),
+            usages: usages.iter().map(|usage| (*usage).to_owned()).collect(),
+        };
+        FsmTypeDecl {
+            name: "operator_invocation".to_owned(),
+            states: vec![
+                state("invocation_created", &[]),
+                state("invocation_running", &["execution_thread"]),
+                state("invocation_completed", &[]),
+                state("exit", &[]),
+            ],
+            transitions: vec![
+                FsmTransitionDecl::Entry("invocation_created".to_owned()),
+                FsmTransitionDecl::Transition(
+                    "invocation_created".to_owned(),
+                    "invocation_running".to_owned(),
+                ),
+                FsmTransitionDecl::Transition(
+                    "invocation_created".to_owned(),
+                    "invocation_completed".to_owned(),
+                ),
+                FsmTransitionDecl::Transition(
+                    "invocation_running".to_owned(),
+                    "invocation_completed".to_owned(),
+                ),
+                FsmTransitionDecl::Transition("invocation_completed".to_owned(), "exit".to_owned()),
+                FsmTransitionDecl::Exit("exit".to_owned()),
+            ],
+        }
+    }
+}
 
 pub trait OperatorInvocationExt {
     fn query_id(&self) -> Option<Uuid>;
-    fn is_complete(&self) -> bool;
     fn belongs_to_query(
         &self,
         operator_plans: &HashMap<Uuid, Uuid>,
@@ -24,26 +115,16 @@ pub trait OperatorInvocationExt {
     ) -> bool;
     fn operator_id(&self) -> Option<Uuid>;
     fn active_span(&self) -> Option<SpanUnixNanoSec>;
-    fn resources_are_valid(
-        &self,
-        plan_workers: &HashMap<Uuid, Uuid>,
-        resources: &InMemoryResources,
-    ) -> bool;
+    fn resources_are_valid(&self, plan_workers: &HashMap<Uuid, Uuid>, model: &DuckDbModel) -> bool;
     fn matches_operator(&self, filter: &OperatorFilter) -> bool;
 }
 
 impl OperatorInvocationExt for OperatorInvocation {
     fn query_id(&self) -> Option<Uuid> {
-        self.first_data().and_then(|transition| match transition {
-            OperatorInvocationTransition::InvocationCreated(created) => Some(created.query_id),
+        match self.first_data()? {
+            OperatorInvocationEvent::InvocationCreated { query_id, .. } => Some(query_id.target),
             _ => None,
-        })
-    }
-
-    fn is_complete(&self) -> bool {
-        self.transitions().last().is_some_and(|transition| {
-            matches!(&transition.data, OperatorInvocationTransition::Exit)
-        })
+        }
     }
 
     fn belongs_to_query(
@@ -53,26 +134,32 @@ impl OperatorInvocationExt for OperatorInvocation {
         plan_ids: &HashSet<Uuid>,
         task_operators: &HashMap<Uuid, HashSet<Uuid>>,
     ) -> bool {
-        self.first_data()
-            .is_some_and(|transition| match transition {
-                OperatorInvocationTransition::InvocationCreated(created) => {
-                    plan_ids.contains(&created.plan_id)
-                        && plan_workers.contains_key(&created.plan_id)
-                        && operator_plans.get(&created.operator_id) == Some(&created.plan_id)
-                        && (created.task_id.is_nil()
-                            || task_operators
-                                .get(&created.task_id)
-                                .is_some_and(|operators| operators.contains(&created.operator_id)))
-                }
-                _ => false,
+        let Some(OperatorInvocationEvent::InvocationCreated {
+            plan_id,
+            task_id,
+            operator_id,
+            ..
+        }) = self.first_data()
+        else {
+            return false;
+        };
+        plan_ids.contains(&plan_id.target)
+            && plan_workers.contains_key(&plan_id.target)
+            && operator_plans.get(&operator_id.target) == Some(&plan_id.target)
+            && task_id.as_ref().is_none_or(|task| {
+                task_operators
+                    .get(&task.target)
+                    .is_some_and(|operators| operators.contains(&operator_id.target))
             })
     }
 
     fn operator_id(&self) -> Option<Uuid> {
-        self.first_data().and_then(|transition| match transition {
-            OperatorInvocationTransition::InvocationCreated(created) => Some(created.operator_id),
+        match self.first_data()? {
+            OperatorInvocationEvent::InvocationCreated { operator_id, .. } => {
+                Some(operator_id.target)
+            }
             _ => None,
-        })
+        }
     }
 
     fn active_span(&self) -> Option<SpanUnixNanoSec> {
@@ -80,8 +167,8 @@ impl OperatorInvocationExt for OperatorInvocation {
             matches!(
                 (&window[0].data, &window[1].data),
                 (
-                    OperatorInvocationTransition::InvocationRunning(_),
-                    OperatorInvocationTransition::InvocationCompleted(_)
+                    OperatorInvocationEvent::InvocationRunning { .. },
+                    OperatorInvocationEvent::InvocationCompleted { .. }
                 )
             )
             .then(|| SpanUnixNanoSec::try_new(window[0].timestamp(), window[1].timestamp()).ok())
@@ -89,36 +176,25 @@ impl OperatorInvocationExt for OperatorInvocation {
         })
     }
 
-    fn resources_are_valid(
-        &self,
-        plan_workers: &HashMap<Uuid, Uuid>,
-        resources: &InMemoryResources,
-    ) -> bool {
-        let Some(OperatorInvocationTransition::InvocationCreated(created)) = self.first_data()
+    fn resources_are_valid(&self, plan_workers: &HashMap<Uuid, Uuid>, model: &DuckDbModel) -> bool {
+        let Some(OperatorInvocationEvent::InvocationCreated { plan_id, .. }) = self.first_data()
         else {
             return false;
         };
-        let Some(worker_id) = plan_workers.get(&created.plan_id) else {
+        let Some(worker_id) = plan_workers.get(&plan_id.target) else {
             return false;
         };
-
         self.transitions()
             .iter()
             .all(|transition| match &transition.data {
-                OperatorInvocationTransition::InvocationRunning(state) => {
-                    state.execution_thread.as_ref().is_some_and(|usage| {
-                        resources
-                            .resources
-                            .get(&usage.resource_id.uuid())
-                            .is_some_and(|resource| {
-                                resource.type_name == crate::model::EXECUTION_THREAD_TYPE_NAME
-                                    && resource.parent_group_id == *worker_id
-                            })
-                    })
-                }
-                OperatorInvocationTransition::InvocationCreated(_)
-                | OperatorInvocationTransition::InvocationCompleted(_)
-                | OperatorInvocationTransition::Exit => true,
+                OperatorInvocationEvent::InvocationRunning {
+                    execution_thread, ..
+                } => model.resource_matches(
+                    execution_thread.target,
+                    crate::model::EXECUTION_THREAD_TYPE_NAME,
+                    *worker_id,
+                ),
+                _ => true,
             })
     }
 
@@ -126,13 +202,6 @@ impl OperatorInvocationExt for OperatorInvocation {
         if filter.operator_ids.is_empty() {
             return true;
         }
-
-        self.first_data()
-            .is_some_and(|transition| match transition {
-                OperatorInvocationTransition::InvocationCreated(created) => {
-                    filter.operator_ids.contains(&created.operator_id)
-                }
-                _ => false,
-            })
+        matches!(self.first_data(), Some(OperatorInvocationEvent::InvocationCreated { operator_id, .. }) if filter.operator_ids.contains(&operator_id.target))
     }
 }

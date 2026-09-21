@@ -368,3 +368,4 @@ generated_extension_loader_package_build.cpp
 
 # quent telemetry events
 events/
+telemetry_events/

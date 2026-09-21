@@ -1,168 +1,119 @@
-# DuckDB Quent telemetry harness
+# DuckDB Quent telemetry
 
-This workspace defines DuckDB's Quent query-engine model, generates its C++
-instrumentation bridge, analyzes captured events, and serves them to the Quent
-UI. It mirrors the corresponding workspace in Sirius and is wired into DuckDB
-through the `BUILD_QUENT_TELEMETRY` CMake option.
+This workspace captures DuckDB execution as Quent events, analyzes captures,
+and serves the Quent UI.
 
-See [INSTRUMENTATION.md](INSTRUMENTATION.md) for entity semantics, design
-reasoning, analyzer guarantees, limitations, and future candidates.
+Human documentation:
 
-See [QUERY_COOKBOOK.md](QUERY_COOKBOOK.md) for copy-paste generated-data and
-TPC-H captures that exercise each UI timeline and overlay.
+- [INSTRUMENTATION.md](INSTRUMENTATION.md): event and resource semantics.
+- [QUERY_COOKBOOK.md](QUERY_COOKBOOK.md): capture and validation workloads.
+- [INSTRUMENTATION_CANDIDATES.md](INSTRUMENTATION_CANDIDATES.md): proposed
+  coverage, cost, and priority.
 
-See [HANDOFF.md](HANDOFF.md) for the complete implementation context, design
-history, validation state, and proposed `BlockPlacement` design.
+Agent-only documentation:
 
-The model contains the standard query-engine entities plus five DuckDB runtime
-FSMs:
+- [AGENT_CONTEXT.md](AGENT_CONTEXT.md): generated-code boundaries, migration
+  constraints, and validation state.
+- [HANDOFF.md](HANDOFF.md): historical investigation notes.
 
-- `pipeline_task` follows one scheduled pipeline task through running, partial
-  yields, blocking, and finalization.
-- `chunk_transfer` records every non-empty chunk published to a physical-plan
-  edge, including its task, operator and port IDs, rows, and logical bytes.
-- `operator_invocation` measures one source, execute, final-execute, or sink
-  call, including its task, physical operator, row counts, and logical bytes.
-- `temporary_block_io` measures one buffer-manager spill or reload, including
-  its causal query, task, operator, memory tag, buffer bytes, and stored bytes.
-- `memory_account` records database-wide buffer-pool, live temporary, and
-  temporary-directory byte occupancy.
+## Architecture
 
-Pipeline tasks use the worker's `task_queue` while queued or ready, and both
-tasks and operator invocations use the stable `execution_thread` on which they
-run. These usages power resource timelines.
+`crates/telemetry/model/model.yaml` is the source of truth.
 
-The included sample emits a connected physical plan so it can be rendered by
-the Quent UI.
-
-## Validate the workspace
-
-```bash
-cd rust
-cargo check --workspace --all-targets
+```text
+model.yaml
+├─ instrumentation build → Rust emitters
+├─ store build           → serialized event types
+└─ C++ schema codegen    → typed native handles
+                              ↓
+DuckDB hooks → exporter → store → analyzer → HTTP API → UI
 ```
 
-## Generate sample plan telemetry
+Do not hand-edit generated types. Change the YAML, transition adapters, native
+hooks, or analyzer as appropriate.
+
+The model covers:
+
+- engine, worker, connection, query, plan, operator, port, and edge structure;
+- pipeline tasks, operator calls, and plan-edge chunk publications;
+- temporary spill and reload operations;
+- execution threads, runnable tasks, temporary-I/O rates, and memory gauges.
+
+## Build
 
 ```bash
-cd rust
-cargo run -p duckdb-telemetry-model --example emit_sample_plan -- \
-    --exporter ndjson --output-dir events
+cd /path/to/duckdb
+cmake -S . -B build/release \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_QUENT_TELEMETRY=ON
+cmake --build build/release --target shell -j4
+
+cargo check --manifest-path rust/Cargo.toml --workspace --all-targets
 ```
 
-The exporter creates one context directory beneath `events/`. Start the analyzer
-server against that directory:
+The bridge requires C++20. Telemetry is runtime-disabled unless
+`QUENT_EXPORTER` is set.
+
+Supported file exporters are `ndjson`, `msgpack`, and `postcard`. `collector`
+sends events to `QUENT_COLLECTOR_ADDRESS`.
+
+## Capture
 
 ```bash
-cargo run -p duckdb-telemetry-server --features ui -- \
-    --output-dir events
-```
+events_dir=$(mktemp -d /tmp/duckdb-quent.XXXXXX)
 
-The server listens for collector traffic on port 7836 and serves the analyzer
-and embedded UI on port 8080 by default.
-
-## Generate the C++ bridge
-
-Enable `BUILD_QUENT_TELEMETRY` to build and link the bridge with both DuckDB
-library targets:
-
-```bash
-cmake -S . -B build/reldebug -DBUILD_QUENT_TELEMETRY=ON
-cmake --build build/reldebug
-```
-
-The bridge build script writes generated C++ sources under `gen/` and headers
-under `include/`; both directories are ignored because they are build products.
-
-## Capture a DuckDB query
-
-Telemetry is runtime-disabled unless `QUENT_EXPORTER` is set. Capture an actual
-DuckDB query into a temporary directory:
-
-```bash
-events_dir=$(mktemp -d)
-QUENT_EXPORTER=ndjson QUENT_OUTPUT_DIR="$events_dir" \
-    build/reldebug/duckdb -c \
+QUENT_EXPORTER=msgpack \
+QUENT_OUTPUT_DIR="$events_dir" \
+build/release/duckdb -c \
     "SET threads=4;
-     CREATE TABLE scan_data AS
-       SELECT i::BIGINT AS i FROM range(5000000) t(i);
-     SELECT sum(i * i) FROM scan_data WHERE i % 7 = 0;"
+     CREATE TABLE t AS SELECT i FROM range(5000000) r(i);
+     SELECT sum(i * i) FROM t WHERE i % 7 = 0;"
 ```
 
-Then serve the completed event stream and open `http://127.0.0.1:8080`:
+Start the service after DuckDB exits:
 
 ```bash
-cd rust
-cargo run -p duckdb-telemetry-server --features ui -- \
-    --output-dir "$events_dir"
+cargo run --manifest-path rust/Cargo.toml \
+    -p duckdb-telemetry-server --features ui -- \
+    --output-dir "$events_dir" \
+    --collector-address 127.0.0.1:7836 \
+    --analyzer-address 127.0.0.1:8080
 ```
 
-Opening the UI after DuckDB exits gives the most reliable stable snapshot;
-collector streams may buffer smaller entity streams until shutdown. The
-analyzer tolerates captures without Engine, Worker, or runtime-resource exit
-events by closing those lifetimes only in its immutable snapshot. It also
-caches an engine on first access, so restart the server if more events are
-added afterward. Supported exporters are `none`, `ndjson`, `msgpack`,
-`postcard`, and `collector`. The collector exporter reads its HTTP endpoint
-from `QUENT_COLLECTOR_ADDRESS`; the server bind address uses
-`QUENT_COLLECTOR_BIND_ADDRESS`.
+Open `http://127.0.0.1:8080`. Restart the service after replacing or extending
+a capture because analyzed engines are cached.
 
-Select the `SELECT sum(...)` query and open its **Timeline** tab, or navigate to
-`/profile/engine/{engine_id}/query/{query_id}/timeline`. Expand `local` for
-worker resources:
+## API smoke test
 
-- `runnable-pipeline-tasks` with `pipeline_task` shows runnable backlog and
-  dispatch delay (`Created` and `Ready`). It approximates scheduler occupancy:
-  `Created` begins just before the initial enqueue and `Ready` just before a
-  yielded task is handed back to the scheduler.
-- `thread-*` with `pipeline_task` shows scheduled task execution (`Running`).
-- `thread-*` with `operator_invocation` shows physical-operator calls
-  (`Running`). Selecting plan operators filters these timelines.
-- `temporary-spill` and `temporary-reload` with `temporary_block_io` show
-  temporary-storage operation and buffer-byte rates.
-
-Expand the Engine root for `buffer-pool-memory`, `temporary-storage`, and
-`temporary-directory-storage`. Select `memory_account` to split byte occupancy
-by memory tag.
-
-The execution-thread lanes represent OS threads, not CPU cores. A task may use
-different lanes after yielding. `Blocked` carries no resource usage because a
-blocked task is neither runnable nor executing.
-
-`SET threads=4` is an upper bound. The `range()` table function is forced
-single-threaded, so a query reading it directly can use one lane. The stored
-table scan above creates several tasks and can use four lanes. Selecting an
-operator highlights tasks whose pipeline contains it; select
-`operator_invocation` for exact operator time.
-
-The query-plan view also shows a data-flow overlay derived from
-`chunk_transfer` publications. It provides per-operator publication rates for
-chunks, rows, and logical bytes, split by upstream operator. These are logical
-flow rates; they do not represent physical copies or memory bandwidth.
-
-Memory accounts are database-wide and timeline-only. Clear any operator
-selection to view them; DuckDB does not retain query or operator ownership for
-these totals. They measure DuckDB charges, not process RSS. A shared buffer
-pool includes all attached databases. A custom buffer manager bypasses all
-three gauges.
-
-The same timeline can be checked directly. Discover the engine, query group,
-and query, then obtain resource IDs and the query duration from the bundle:
+Discover IDs in this order:
 
 ```bash
-curl -s http://127.0.0.1:8080/api/engines
-curl -s http://127.0.0.1:8080/api/engines/{engine_id}/query-groups
-curl -s http://127.0.0.1:8080/api/engines/{engine_id}/query_group/{query_group_id}/queries
-curl -s http://127.0.0.1:8080/api/engines/{engine_id}/query/{query_id}
+curl -s 'http://127.0.0.1:8080/api/engines?with_metadata=true'
+curl -s 'http://127.0.0.1:8080/api/engines/{engine_id}'
+curl -s 'http://127.0.0.1:8080/api/engines/{engine_id}/contexts'
+curl -s 'http://127.0.0.1:8080/api/engines/{engine_id}/query-groups'
+curl -s 'http://127.0.0.1:8080/api/engines/{engine_id}/query_group/{group_id}/queries'
+curl -s 'http://127.0.0.1:8080/api/engines/{engine_id}/query/{query_id}'
 ```
 
-Then request an execution-thread operator timeline, using the query duration as
-`end`:
+`/contexts` returns `context_ids`. The query response supplies resource IDs and
+the query-relative duration needed by timeline requests.
+
+Runtime instances use:
+
+```text
+POST /api/engines/{engine_id}/entities
+POST /api/engines/{engine_id}/timeline/single
+POST /api/engines/{engine_id}/timeline/bulk
+POST /api/engines/{engine_id}/timeline/data-flow
+```
+
+Example execution-thread request:
 
 ```bash
 curl -s -X POST \
     -H 'content-type: application/json' \
-    http://127.0.0.1:8080/api/engines/{engine_id}/timeline/single \
+    'http://127.0.0.1:8080/api/engines/{engine_id}/timeline/single' \
     -d '{
       "entry": {"Resource": {
         "resource_id": "{execution_thread_id}",
@@ -175,34 +126,19 @@ curl -s -X POST \
     }'
 ```
 
-The query bundle advertises all runtime FSM declarations. Runtime instances
-are available through `POST /api/engines/{engine_id}/entities` with
-`filter.entity_type_name` set to `pipeline_task`, `chunk_transfer`, or
-`operator_invocation`, or `temporary_block_io`. The analyzer also exposes
-`DuckDbUiAnalyzer::chunk_summary(query_id)` for totals by physical-plan edge.
+## UI meanings
 
-## Capture temporary I/O
+| Selection | Meaning |
+|---|---|
+| `runnable-pipeline-tasks` + `pipeline_task` | Runnable approximation |
+| `thread-*` + `pipeline_task` | Task wall time |
+| `thread-*` + `operator_invocation` | Physical-operator call wall time |
+| `temporary-spill` or `temporary-reload` | Buffer-manager service rate |
+| `buffer-pool-memory` | Managed-memory charge |
+| `temporary-storage` | Live evicted representations |
+| `temporary-directory-storage` | Accounted file extent |
+| Plan data-flow overlay | Published chunks, rows, and logical bytes |
 
-This external hash join emits spill and reload operations:
-
-```bash
-events_dir=$(mktemp -d)
-spill_dir=$(mktemp -d)
-QUENT_EXPORTER=ndjson QUENT_OUTPUT_DIR="$events_dir" \
-    build/reldebug/duckdb -c \
-    "SET threads=4;
-     SET memory_limit='128MB';
-     SET temp_directory='$spill_dir';
-     SET preserve_insertion_order=false;
-     SET debug_force_external=true;
-     SELECT count(*)
-     FROM range(10000000) a(i)
-     JOIN range(10000000) b(i) USING (i);"
-```
-
-`buffer_bytes` is the page-aligned in-memory buffer size. `storage_bytes` is
-the temporary representation size. Timeline rates measure synchronous
-buffer-manager service, including compression, encryption, locks, and file
-work; they are not device bandwidth. Spill attribution names the operator that
-caused eviction, not the evicted block's owner. Custom buffer managers bypass
-this probe.
+Execution-thread lanes are OS threads, not CPU cores. Task-queue occupancy is
+an approximation. Chunk bytes are logical bytes, not copies or bandwidth.
+Memory gauges are database-wide DuckDB accounting, not query ownership or RSS.
