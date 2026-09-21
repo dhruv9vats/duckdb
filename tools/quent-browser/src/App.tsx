@@ -2,7 +2,82 @@ import { useSyncExternalStore, useState } from 'react';
 import { QuentFrame } from './quent-frame';
 import type { BrowserSession } from './session';
 
-const DEFAULT_SQL = `SELECT count(*) AS answer\nFROM range(1000);`;
+const DEFAULT_SQL = `-- Quent showcase: joins, aggregation, windows, and Top-N
+WITH customers AS (
+    SELECT i AS customer_id, i % 8 AS region_id, i % 5 AS segment_id
+    FROM range(5000) AS t(i)
+),
+products AS (
+    SELECT i AS product_id, i % 12 AS category_id, 100 + (i * 37) % 9900 AS price_cents
+    FROM range(500) AS t(i)
+),
+orders AS (
+    SELECT i AS order_id,
+           i % 5000 AS customer_id,
+           DATE '2023-01-01' + CAST(i % 730 AS INTEGER) AS order_date,
+           i % 4 AS channel_id,
+           i % 5 AS status_id
+    FROM range(50000) AS t(i)
+),
+line_items AS (
+    SELECT i AS line_id,
+           i % 50000 AS order_id,
+           (i * 13) % 500 AS product_id,
+           1 + i % 7 AS quantity,
+           i % 16 AS discount_pct
+    FROM range(150000) AS t(i)
+),
+sales AS (
+    SELECT c.region_id,
+           c.segment_id,
+           p.category_id,
+           o.channel_id,
+           year(o.order_date) AS sales_year,
+           count(*) AS line_count,
+           count(DISTINCT o.order_id) AS order_count,
+           sum(l.quantity) AS units,
+           sum((p.price_cents * l.quantity * (100 - l.discount_pct)) // 100) AS revenue_cents,
+           round(avg(p.price_cents), 2) AS average_price_cents,
+           min(p.price_cents) AS lowest_price_cents,
+           max(p.price_cents) AS highest_price_cents
+    FROM line_items AS l
+    JOIN orders AS o ON o.order_id = l.order_id
+    JOIN customers AS c ON c.customer_id = o.customer_id
+    JOIN products AS p ON p.product_id = l.product_id
+    WHERE o.status_id <> 4 AND l.quantity >= 2
+    GROUP BY c.region_id, c.segment_id, p.category_id, o.channel_id, sales_year
+),
+ranked AS (
+    SELECT *,
+           dense_rank() OVER (
+               PARTITION BY region_id, sales_year
+               ORDER BY revenue_cents DESC
+           ) AS revenue_rank,
+           sum(revenue_cents) OVER (
+               PARTITION BY region_id, sales_year
+               ORDER BY revenue_cents DESC, category_id, segment_id, channel_id
+               ROWS UNBOUNDED PRECEDING
+           ) AS running_revenue_cents
+    FROM sales
+)
+SELECT region_id,
+       segment_id,
+       category_id,
+       channel_id,
+       sales_year,
+       line_count,
+       order_count,
+       units,
+       revenue_cents,
+       average_price_cents,
+       lowest_price_cents,
+       highest_price_cents,
+       revenue_rank,
+       running_revenue_cents
+FROM ranked
+WHERE revenue_rank <= 3
+ORDER BY revenue_cents DESC, region_id, sales_year, category_id
+LIMIT 40;`;
 
 export function App({ session }: { session: BrowserSession }) {
   const snapshot = useSyncExternalStore(

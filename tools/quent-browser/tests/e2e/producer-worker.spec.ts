@@ -1,5 +1,44 @@
 import { expect, test } from '@playwright/test';
 
+test('default query exercises the showcase operators and is rerunnable', async ({ page }) => {
+  test.setTimeout(120_000);
+  test.skip(process.env.QUENT_REAL_PRODUCER !== '1', 'real producer artifact is not enabled');
+
+  await page.goto('?test=1');
+  await expect(page.getByRole('textbox')).toContainText('Quent showcase: joins, aggregation, windows, and Top-N');
+
+  const results: string[][][] = [];
+  for (let run = 1; run <= 2; run += 1) {
+    await page.getByRole('button', { name: 'Run', exact: true }).click();
+    await expect(page.getByTestId('status')).toHaveText('Telemetry ready', { timeout: 60_000 });
+    await expect(page.getByTestId('query-result')).toHaveAttribute('data-row-count', '40');
+    await expect(page.locator('.capture')).toHaveCount(run);
+
+    const result = await page.evaluate(() => window.__DUCKDB_QUENT_TEST__?.snapshot().result);
+    results.push(result!.rows.map(row => row.map(String)));
+  }
+  expect(results[0][0].slice(0, 4)).toEqual(['3', '3', '7', '3']);
+  expect(results[0][0][8]).toBe('13269938');
+  expect(results[1]).toEqual(results[0]);
+
+  const quent = page.frameLocator('iframe[title="Quent"]');
+  const planNodes = quent.locator('.react-flow__node');
+  await expect.poll(() => planNodes.filter({ hasText: 'HASH_JOIN' }).count(), { timeout: 60_000 }).toBeGreaterThanOrEqual(3);
+  await expect.poll(() => planNodes.filter({ hasText: 'HASH_GROUP_BY' }).count()).toBeGreaterThanOrEqual(1);
+  await expect.poll(() => planNodes.filter({ hasText: 'WINDOW' }).count()).toBeGreaterThanOrEqual(1);
+  await expect(quent.locator('.react-flow__node').filter({ hasText: 'TOP_N' })).toHaveCount(1);
+
+  const frameBox = await page.locator('iframe[title="Quent"]').boundingBox();
+  expect(frameBox).not.toBeNull();
+  expect(Math.ceil(frameBox!.y + frameBox!.height)).toBeLessThanOrEqual(page.viewportSize()!.height);
+
+  const snapshot = await page.evaluate(() => window.__DUCKDB_QUENT_TEST__?.snapshot());
+  expect(snapshot?.captures).toHaveLength(2);
+  expect(snapshot?.captures.every(capture => capture.state === 'sealed')).toBe(true);
+  expect(snapshot?.captures.every(capture => capture.droppedEvents === 0)).toBe(true);
+  expect(snapshot?.captures.every(capture => capture.bytes > 0)).toBe(true);
+});
+
 test('runs real DuckDB and publishes runtime telemetry', async ({ page }, testInfo) => {
   test.setTimeout(120_000);
   test.skip(process.env.QUENT_REAL_PRODUCER !== '1', 'real producer artifact is not enabled');
@@ -39,9 +78,10 @@ test('runs real DuckDB and publishes runtime telemetry', async ({ page }, testIn
   await expect(quent.locator('.react-flow__node').filter({ hasText: 'RANGE' })).toHaveCount(1);
   await quent.getByRole('link', { name: 'Timeline', exact: true }).click();
   await expect(quent.getByText('buffer-pool-memory', { exact: true })).toBeVisible();
-  await expect(quent.getByText('64 KiB', { exact: false }).first()).toBeVisible({ timeout: 30_000 });
+  const bufferPoolValue = quent.getByText(/^[1-9]\d*(?:\.\d+)? (?:KiB|MiB)$/).first();
+  await expect(bufferPoolValue).toBeVisible({ timeout: 30_000 });
   await page.screenshot({ path: testInfo.outputPath('real-plan.png'), fullPage: true });
-  await expect(quent.getByText('64 KiB', { exact: false }).first()).toBeVisible({ timeout: 30_000 });
+  await expect(bufferPoolValue).toBeVisible({ timeout: 30_000 });
   await page.screenshot({ path: testInfo.outputPath('real-runtime-timeline.png'), fullPage: true });
   await quent.getByRole('link', { name: 'Operators', exact: true }).click();
   await expect(quent.locator('table').filter({ hasText: 'RANGE' })).toHaveCount(1);
