@@ -1,70 +1,289 @@
 use duckdb_telemetry_store::MemoryAccountEvent;
 use quent_analyzer::{
-    AnalyzerResult, Entity,
-    fsm::{
-        Fsm, FsmUsages,
-        native::{AnalyzedFsm, AnalyzedFsmBuilder, AnalyzedTransition},
-    },
-    resource::{Usage, Using},
+    AnalyzerError, AnalyzerResult, Entity,
+    fsm::{Fsm, FsmUsages, Transition, native::TransitionEvent},
+    resource::{AnalyzedUsage, CapacityValue, Usage, Using},
 };
+use quent_events::Event;
 use quent_query_engine_ui::OperatorFilter;
-use quent_time::TimeUnixNanoSec;
+use quent_time::{TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec};
 use quent_ui::fsm::{FsmStateTypeDecl, FsmTransitionDecl, FsmTypeDecl, FsmTypeDeclaration};
+use smallvec::SmallVec;
 use uuid::Uuid;
 
 use crate::model::DuckDbModel;
 
-pub(crate) type MemoryAccountBuilder = AnalyzedFsmBuilder<MemoryAccountEvent>;
+pub(crate) struct MemoryAccountBuilder {
+    id: Uuid,
+    events: Vec<Event<MemoryAccountEvent>>,
+}
+
+impl MemoryAccountBuilder {
+    pub(crate) fn try_new(id: Uuid) -> AnalyzerResult<Self> {
+        if id.is_nil() {
+            return Err(AnalyzerError::Validation(
+                "memory account id cannot be nil".to_owned(),
+            ));
+        }
+
+        Ok(Self {
+            id,
+            events: Vec::new(),
+        })
+    }
+
+    pub(crate) fn push_transition(&mut self, event: Event<MemoryAccountEvent>) {
+        self.events.push(event);
+    }
+}
 
 #[derive(Debug)]
-pub(crate) struct MemoryAccount(AnalyzedFsm<MemoryAccountEvent>);
+pub(crate) struct MemoryTransition {
+    timestamp: TimeUnixNanoSec,
+    usages: SmallVec<[AnalyzedUsage; 1]>,
+    pub(crate) data: MemoryAccountEvent,
+}
+
+impl Timestamp for MemoryTransition {
+    fn timestamp(&self) -> TimeUnixNanoSec {
+        self.timestamp
+    }
+}
+
+impl Transition for MemoryTransition {
+    fn name(&self) -> &str {
+        self.data.name()
+    }
+
+    fn sequence(&self) -> u16 {
+        self.data.sequence()
+    }
+
+    fn is_final(&self) -> bool {
+        self.data.is_final()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct MemoryAccount {
+    id: Uuid,
+    transitions: Vec<MemoryTransition>,
+    snapshot_bound: Option<TimeUnixNanoSec>,
+}
 
 impl MemoryAccount {
     pub(crate) fn try_from_builder(builder: MemoryAccountBuilder) -> AnalyzerResult<Self> {
-        Ok(Self(builder.try_build()?))
+        Self::build(builder, None)
     }
-    pub(crate) fn transitions(&self) -> &[AnalyzedTransition<MemoryAccountEvent>] {
-        self.0.transitions()
+
+    pub(crate) fn try_from_snapshot(
+        builder: MemoryAccountBuilder,
+        watermark: TimeUnixNanoSec,
+    ) -> AnalyzerResult<Self> {
+        Self::build(builder, Some(watermark))
     }
+
+    fn build(
+        mut builder: MemoryAccountBuilder,
+        watermark: Option<TimeUnixNanoSec>,
+    ) -> AnalyzerResult<Self> {
+        builder
+            .events
+            .sort_by_key(|event| (event.timestamp, event.data.sequence()));
+        if let Some(events) = builder.events.windows(2).find(|events| {
+            events[0].timestamp == events[1].timestamp
+                && events[0].data.sequence() == events[1].data.sequence()
+        }) {
+            return Err(AnalyzerError::Validation(format!(
+                "memory account {} has duplicate transition ({}, {})",
+                builder.id,
+                events[0].timestamp,
+                events[0].data.sequence()
+            )));
+        }
+        let Some(first) = builder.events.first() else {
+            return Err(AnalyzerError::IncompleteFsm(format!(
+                "memory account {} is empty",
+                builder.id
+            )));
+        };
+        if !first.data.is_initial() {
+            return Err(AnalyzerError::Validation(format!(
+                "memory account {} starts with {}",
+                builder.id,
+                first.data.name()
+            )));
+        }
+        if let Some(events) = builder
+            .events
+            .windows(2)
+            .find(|events| !events[0].data.is_valid_next(&events[1].data))
+        {
+            return Err(AnalyzerError::Validation(format!(
+                "memory account {} cannot transition from {} to {}",
+                builder.id,
+                events[0].data.name(),
+                events[1].data.name()
+            )));
+        }
+
+        let last_timestamp = builder.events.last().unwrap().timestamp;
+        let is_closed = builder
+            .events
+            .last()
+            .is_some_and(|event| event.data.is_final());
+        let snapshot_bound = if is_closed {
+            None
+        } else {
+            let Some(watermark) = watermark else {
+                return Err(AnalyzerError::IncompleteFsm(format!(
+                    "memory account {} has no final transition",
+                    builder.id
+                )));
+            };
+            if watermark < last_timestamp {
+                return Err(AnalyzerError::Validation(format!(
+                    "memory account {} snapshot watermark {watermark} precedes event {last_timestamp}",
+                    builder.id
+                )));
+            }
+            Some(watermark)
+        };
+        let transitions = builder
+            .events
+            .into_iter()
+            .map(|event| MemoryTransition {
+                timestamp: event.timestamp,
+                usages: event.data.usages(),
+                data: event.data,
+            })
+            .collect();
+
+        Ok(Self {
+            id: builder.id,
+            transitions,
+            snapshot_bound,
+        })
+    }
+
+    pub(crate) fn transitions(&self) -> &[MemoryTransition] {
+        &self.transitions
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_snapshot_bounded(&self) -> bool {
+        self.snapshot_bound.is_some()
+    }
+
+    pub(crate) fn snapshot_bound(&self) -> Option<TimeUnixNanoSec> {
+        self.snapshot_bound
+    }
+
     fn first_data(&self) -> Option<&MemoryAccountEvent> {
-        self.0.transition(0).map(|transition| &transition.data)
+        self.transitions.first().map(|transition| &transition.data)
+    }
+}
+
+impl MemoryTransition {
+    pub(crate) fn usages(&self) -> &[AnalyzedUsage] {
+        &self.usages
     }
 }
 
 impl Entity for MemoryAccount {
     fn id(&self) -> Uuid {
-        self.0.id()
+        self.id
     }
     fn type_name(&self) -> &str {
         "memory_account"
     }
     fn earliest_timestamp(&self) -> TimeUnixNanoSec {
-        self.0.earliest_timestamp()
+        self.transitions.first().unwrap().timestamp()
     }
     fn latest_timestamp(&self) -> TimeUnixNanoSec {
-        self.0.latest_timestamp()
+        self.snapshot_bound
+            .unwrap_or_else(|| self.transitions.last().unwrap().timestamp())
     }
 }
 
 impl Fsm for MemoryAccount {
-    type TransitionType = AnalyzedTransition<MemoryAccountEvent>;
+    type TransitionType = MemoryTransition;
     fn len(&self) -> usize {
-        self.0.len()
+        self.transitions.len().saturating_sub(1)
     }
     fn transition(&self, index: usize) -> Option<&Self::TransitionType> {
-        self.0.transition(index)
+        self.transitions.get(index)
+    }
+}
+
+struct MemoryUsage<'a> {
+    account_id: Uuid,
+    usage: &'a AnalyzedUsage,
+    span: SpanUnixNanoSec,
+}
+
+impl<'a> Usage<'a> for MemoryUsage<'a> {
+    fn entity_id(&self) -> Uuid {
+        self.account_id
+    }
+
+    fn resource_id(&self) -> Uuid {
+        self.usage.resource_id
+    }
+
+    fn capacities(&self) -> impl Iterator<Item = &'a CapacityValue> {
+        self.usage.capacities.iter()
+    }
+
+    fn span(&self) -> SpanUnixNanoSec {
+        self.span
     }
 }
 
 impl<'a> FsmUsages<'a> for MemoryAccount {
     fn usages_with_state_names(&'a self) -> impl Iterator<Item = (&'a str, impl Usage<'a>)> {
-        self.0.usages_with_state_names()
+        self.transitions
+            .iter()
+            .zip(self.transition_ends())
+            .flat_map(move |(transition, end)| {
+                let span = SpanUnixNanoSec::try_new(transition.timestamp(), end).unwrap();
+                transition.usages.iter().map(move |usage| {
+                    (
+                        transition.name(),
+                        MemoryUsage {
+                            account_id: self.id,
+                            usage,
+                            span,
+                        },
+                    )
+                })
+            })
     }
 }
 
 impl Using for MemoryAccount {
     fn usages(&self) -> impl Iterator<Item = impl Usage<'_>> {
-        self.0.usages()
+        self.transitions
+            .iter()
+            .zip(self.transition_ends())
+            .flat_map(move |(transition, end)| {
+                let span = SpanUnixNanoSec::try_new(transition.timestamp(), end).unwrap();
+                transition.usages.iter().map(move |usage| MemoryUsage {
+                    account_id: self.id,
+                    usage,
+                    span,
+                })
+            })
+    }
+}
+
+impl MemoryAccount {
+    fn transition_ends(&self) -> impl Iterator<Item = TimeUnixNanoSec> + '_ {
+        self.transitions
+            .iter()
+            .skip(1)
+            .map(Timestamp::timestamp)
+            .chain(self.snapshot_bound)
     }
 }
 

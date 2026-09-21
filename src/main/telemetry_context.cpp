@@ -34,8 +34,10 @@ static constexpr const char *TELEMETRY_STATE_NAME = "quent_telemetry";
 static constexpr const char *EXPORTER_ENV = "QUENT_EXPORTER";
 static constexpr const char *OUTPUT_DIR_ENV = "QUENT_OUTPUT_DIR";
 static constexpr const char *COLLECTOR_ADDRESS_ENV = "QUENT_COLLECTOR_ADDRESS";
+static constexpr const char *BROWSER_CAPTURE_BYTES_ENV = "QUENT_BROWSER_CAPTURE_BYTES";
 static constexpr const char *DEFAULT_OUTPUT_DIR = "events";
 static constexpr const char *DEFAULT_COLLECTOR_ADDRESS = "http://localhost:7836";
+static constexpr uint64_t DEFAULT_BROWSER_CAPTURE_BYTES = 64ULL * 1024ULL * 1024ULL;
 static constexpr const char *TEMP_SPILL_NAME = "temporary-spill";
 static constexpr const char *TEMP_RELOAD_NAME = "temporary-reload";
 static constexpr const char *BUFFER_POOL_MEMORY_NAME = "buffer-pool-memory";
@@ -365,6 +367,17 @@ private:
 };
 
 static quent::Context CreateContext(const string &name) {
+#ifdef DUCKDB_QUENT_BROWSER_TELEMETRY
+	if (name == "browser") {
+		auto limit = FileSystem::GetEnvVariable(BROWSER_CAPTURE_BYTES_ENV);
+		try {
+			return quent::Context::browser(limit.empty() ? DEFAULT_BROWSER_CAPTURE_BYTES : std::stoull(limit));
+		} catch (...) {
+			throw InvalidInputException("Invalid browser telemetry capture limit");
+		}
+	}
+	throw InvalidInputException("Browser telemetry only supports the browser exporter");
+#else
 	if (name == "ndjson") {
 		auto output_dir = FileSystem::GetEnvVariable(OUTPUT_DIR_ENV);
 		return quent::Context::ndjson(output_dir.empty() ? DEFAULT_OUTPUT_DIR : output_dir);
@@ -382,6 +395,7 @@ static quent::Context CreateContext(const string &name) {
 		return quent::Context::collector(address.empty() ? DEFAULT_COLLECTOR_ADDRESS : address);
 	}
 	throw InvalidInputException("Unknown Quent exporter: %s", name);
+#endif
 }
 
 class TelemetryContext::Impl {
@@ -1114,6 +1128,48 @@ private:
 		return buffer_pool_memory.has_value();
 	}
 
+	BrowserTelemetryBatch DrainBrowserEvents(uint64_t max_bytes) {
+#ifdef DUCKDB_QUENT_BROWSER_TELEMETRY
+		auto batch = context.browser_drain(max_bytes);
+		return {std::move(batch.payload), batch.event_count, batch.min_timestamp, batch.max_timestamp,
+		        context.browser_dropped(), batch.failed ? BrowserTelemetryStatus::FAILED : BrowserTelemetryStatus::READY};
+#else
+		return {{}, 0, 0, 0, 0, BrowserTelemetryStatus::UNAVAILABLE};
+#endif
+	}
+
+	vector<string> BrowserTelemetryQueryIds() {
+#ifdef DUCKDB_QUENT_BROWSER_TELEMETRY
+		return context.browser_query_ids();
+#else
+		return {};
+#endif
+	}
+
+	string BrowserTelemetryContextId() {
+#ifdef DUCKDB_QUENT_BROWSER_TELEMETRY
+		return context.browser_context_id();
+#else
+		return string();
+#endif
+	}
+
+	uint64_t BrowserTelemetryWatermark() {
+#ifdef DUCKDB_QUENT_BROWSER_TELEMETRY
+		return context.browser_watermark();
+#else
+		return 0;
+#endif
+	}
+
+	bool BeginBrowserTelemetryRun() {
+#ifdef DUCKDB_QUENT_BROWSER_TELEMETRY
+		return context.browser_begin_run();
+#else
+		return false;
+#endif
+	}
+
 	IoChannelOperating CreateIoChannel(const char *name) {
 		quent::temporary_io_channel::Initializing initializing {name, quent::worker::WorkerId(worker_id)};
 		auto handle = std::move(temporary_io_channel_observer->handle()).initializing(std::move(initializing));
@@ -1444,6 +1500,61 @@ shared_ptr<duckdb::MemoryUsageProbe> TelemetryContext::MemoryUsageProbe() {
 	return make_shared_ptr<Impl::MemoryProbe>(impl);
 }
 
+BrowserTelemetryBatch TelemetryContext::DrainBrowserEvents(uint64_t max_bytes) {
+	if (!impl) {
+		return {{}, 0, 0, 0, 0, BrowserTelemetryStatus::UNAVAILABLE};
+	}
+	try {
+		return impl->DrainBrowserEvents(max_bytes);
+	} catch (...) {
+		return {{}, 0, 0, 0, 0, BrowserTelemetryStatus::FAILED};
+	}
+}
+
+vector<string> TelemetryContext::BrowserTelemetryQueryIds() {
+	if (!impl) {
+		return {};
+	}
+	try {
+		return impl->BrowserTelemetryQueryIds();
+	} catch (...) {
+		return {};
+	}
+}
+
+string TelemetryContext::BrowserTelemetryContextId() {
+	if (!impl) {
+		return string();
+	}
+	try {
+		return impl->BrowserTelemetryContextId();
+	} catch (...) {
+		return string();
+	}
+}
+
+uint64_t TelemetryContext::BrowserTelemetryWatermark() {
+	if (!impl) {
+		return 0;
+	}
+	try {
+		return impl->BrowserTelemetryWatermark();
+	} catch (...) {
+		return 0;
+	}
+}
+
+bool TelemetryContext::BeginBrowserTelemetryRun() {
+	if (!impl) {
+		return false;
+	}
+	try {
+		return impl->BeginBrowserTelemetryRun();
+	} catch (...) {
+		return false;
+	}
+}
+
 void TelemetryContext::StartExecution(ClientContext &context, const PhysicalOperator &root) {
 	try {
 		auto state = context.registered_state->Get<Impl::ClientState>(TELEMETRY_STATE_NAME);
@@ -1572,6 +1683,26 @@ shared_ptr<TemporaryIoProbe> TelemetryContext::TempIoProbe() {
 
 shared_ptr<duckdb::MemoryUsageProbe> TelemetryContext::MemoryUsageProbe() {
 	return nullptr;
+}
+
+BrowserTelemetryBatch TelemetryContext::DrainBrowserEvents(uint64_t) {
+	return {{}, 0, 0, 0, 0, BrowserTelemetryStatus::UNAVAILABLE};
+}
+
+vector<string> TelemetryContext::BrowserTelemetryQueryIds() {
+	return {};
+}
+
+string TelemetryContext::BrowserTelemetryContextId() {
+	return string();
+}
+
+uint64_t TelemetryContext::BrowserTelemetryWatermark() {
+	return 0;
+}
+
+bool TelemetryContext::BeginBrowserTelemetryRun() {
+	return false;
 }
 
 void TelemetryContext::StartExecution(ClientContext &, const PhysicalOperator &) {

@@ -42,6 +42,7 @@ class ExternalFileCache;
 class ResultSetManager;
 struct ParserCache;
 class TelemetryContext;
+struct BrowserTelemetryBatch;
 
 class DatabaseInstance : public enable_shared_from_this<DatabaseInstance> {
 	friend class DuckDB;
@@ -84,6 +85,12 @@ public:
 	DUCKDB_API bool ExtensionIsLoaded(const string &name);
 
 	DUCKDB_API SettingLookupResult TryGetCurrentSetting(const Identifier &key, Value &result) const;
+
+	BrowserTelemetryBatch DrainBrowserEvents(uint64_t max_bytes);
+	vector<string> BrowserTelemetryQueryIds();
+	string BrowserTelemetryContextId();
+	uint64_t BrowserTelemetryWatermark();
+	bool BeginBrowserTelemetryRun();
 
 	DUCKDB_API shared_ptr<EncryptionUtil> GetEncryptionUtil(bool read_only = false);
 	shared_ptr<EncryptionUtil> GetMbedTLSUtil(bool force_mbedtls) const;

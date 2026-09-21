@@ -5,9 +5,29 @@ FetchContent_Declare(
   GIT_TAG v0.6.1)
 FetchContent_MakeAvailable(Corrosion)
 
-corrosion_import_crate(
-  MANIFEST_PATH Cargo.toml
-  CRATES duckdb-telemetry-bridge)
+if(EMSCRIPTEN AND BUILD_QUENT_BROWSER_TELEMETRY)
+  corrosion_import_crate(
+    MANIFEST_PATH Cargo.toml
+    CRATES duckdb-telemetry-bridge
+    FEATURES browser
+    FLAGS -Zbuild-std=std,panic_abort)
+  corrosion_set_env_vars(
+    duckdb_telemetry_bridge
+    "RUSTC_BOOTSTRAP=1")
+else()
+  corrosion_import_crate(
+    MANIFEST_PATH Cargo.toml
+    CRATES duckdb-telemetry-bridge)
+endif()
+
+if(EMSCRIPTEN AND BUILD_QUENT_BROWSER_TELEMETRY)
+  target_compile_definitions(duckdb_telemetry_bridge INTERFACE DUCKDB_QUENT_BROWSER_TELEMETRY)
+endif()
+
+set(TELEMETRY_INCLUDE_PROFILE native)
+if(EMSCRIPTEN AND BUILD_QUENT_BROWSER_TELEMETRY)
+  set(TELEMETRY_INCLUDE_PROFILE browser)
+endif()
 
 set_target_properties(
   duckdb_telemetry_bridge
@@ -18,7 +38,7 @@ set_target_properties(
 target_include_directories(
   duckdb_telemetry_bridge
   INTERFACE
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/${TELEMETRY_INCLUDE_PROFILE}>
     $<INSTALL_INTERFACE:${INSTALL_INCLUDE_DIR}>)
 
 if(DEFINED DUCKDB_EXPORT_SET)

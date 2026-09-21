@@ -9,6 +9,10 @@ Human documentation:
 - [QUERY_COOKBOOK.md](QUERY_COOKBOOK.md): capture and validation workloads.
 - [INSTRUMENTATION_CANDIDATES.md](INSTRUMENTATION_CANDIDATES.md): proposed
   coverage, cost, and priority.
+- [BROWSER_INSTRUMENTATION_CANDIDATES.md](BROWSER_INSTRUMENTATION_CANDIDATES.md):
+  browser-focused hook and inference constraints.
+- [FULL_QUENT_BROWSER_PLAN.md](FULL_QUENT_BROWSER_PLAN.md): full iframe UI,
+  bridge, verification, and Pages release contract.
 
 Agent-only documentation:
 
@@ -142,3 +146,33 @@ curl -s -X POST \
 Execution-thread lanes are OS threads, not CPU cores. Task-queue occupancy is
 an approximation. Chunk bytes are logical bytes, not copies or bandwidth.
 Memory gauges are database-wide DuckDB accounting, not query ownership or RSS.
+
+## Browser application
+
+`tools/quent-browser` runs SQL and telemetry analysis in separate browser
+workers. A same-origin iframe renders the pinned full Quent application. Its
+allowlisted `ApiClient` uses a transferred port rather than HTTP or a global
+`fetch` override. Captures are ephemeral; a full-page reload loses them.
+Browser builds disable Copy Link rather than emit a URL that cannot reconstruct
+an in-memory capture.
+
+The initial browser capability set is intentionally narrow: one query at a
+time, one persistent single-threaded database, no spill-I/O telemetry, bounded
+4 MiB batches and a 64 MiB encoded session. SQL results may appear before
+telemetry; only the telemetry view waits for an acknowledged capture seal.
+Failed, cancelled, incomplete, and overflowed captures remain distinct.
+The result row limit bounds only the rendered preview. DuckDB materializes the
+full result before serialization, so it is not a query-memory limit; aggregate
+queries are safer for demonstrations.
+
+Each immutable revision replays the bounded session. Retained revisions use a
+512 MiB estimated snapshot budget at ten times their encoded source bytes.
+This is admission accounting, not an allocator or RSS cap. Eight revisions is
+an upper bound, not a retention promise; the application requires reset when a
+session or snapshot budget is exhausted.
+
+See `tools/quent-browser/README.md` for reproducible builds and tests. Fixture
+mode is visibly labelled and is not evidence of DuckDB execution.
+Pushing `quent` publishes the verified static artifact to
+`https://dhruv9vats.github.io/duckdb/` after Pages is set to GitHub Actions and
+the `github-pages` environment permits that branch.

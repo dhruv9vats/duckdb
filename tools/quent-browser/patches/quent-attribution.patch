@@ -1,0 +1,48 @@
+diff --git a/ui/packages/@quent/components/src/dag/DAGChart.tsx b/ui/packages/@quent/components/src/dag/DAGChart.tsx
+index c55fcd6..479d6fb 100644
+--- a/ui/packages/@quent/components/src/dag/DAGChart.tsx
++++ b/ui/packages/@quent/components/src/dag/DAGChart.tsx
+@@ -549,6 +549,5 @@ const DAGFlow = ({
+       onPaneClick={handlePaneClick}
+       onMoveStart={handleMoveStart}
+-      proOptions={{ hideAttribution: true }}
+       nodeTypes={nodeTypes}
+       edgeTypes={edgeTypes}
+       fitView
+diff --git a/ui/src/features/deep-link/CopyLinkButton.tsx b/ui/src/features/deep-link/CopyLinkButton.tsx
+index a0d26a2..9c8e3b3 100644
+--- a/ui/src/features/deep-link/CopyLinkButton.tsx
++++ b/ui/src/features/deep-link/CopyLinkButton.tsx
+@@ -14,6 +14,8 @@ type CopyFeedback =
+   | { kind: 'success'; message: 'Link copied' }
+   | { kind: 'error'; message: string };
+ 
++const EPHEMERAL_CAPTURE_MESSAGE = 'Links are unavailable for in-memory captures.';
++
+ export function CopyLinkButton() {
+   const deepLink = useDeepLink();
+   const [feedback, setFeedback] = useState<CopyFeedback>({ kind: 'idle', message: '' });
+@@ -70,6 +72,23 @@ export function CopyLinkButton() {
+   if (!portalTarget) {
+     return null;
+   }
++  if (import.meta.env.VITE_EPHEMERAL_PROFILES === 'true') {
++    return createPortal(
++      <Button
++        type="button"
++        variant="ghost"
++        size="icon"
++        className="h-9 w-9"
++        aria-label="Copy Link"
++        title={EPHEMERAL_CAPTURE_MESSAGE}
++        disabled
++      >
++        <Share2 />
++      </Button>,
++      portalTarget
++    );
++  }
++
+   return createPortal(
+     <>
+       <Button

@@ -5,10 +5,11 @@ edition.workspace = true
 
 [features]
 collector = ["quent-instrumentation/io-collector"]
+browser = ["quent-instrumentation/io-callback"]
 
 [dependencies]
 quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", features = ["serde"] }
-quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", features = ["io-msgpack", "io-ndjson", "io-postcard"] }
+quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", default-features = false }
 serde = { version = "1", features = ["derive"] }
 uuid = { version = "1", features = ["serde", "v7"] }
 

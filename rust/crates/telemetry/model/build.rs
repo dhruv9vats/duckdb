@@ -18,8 +18,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &parsed.schema,
         &Options {
             analyzer_package: Some("duckdb-telemetry-analyzer".to_owned()),
-            collector_sink: true,
+            collector_sink: std::env::var_os("CARGO_FEATURE_BROWSER").is_none(),
             serde: true,
+            umbrella_event: true,
             ..Options::default()
         },
     )?;

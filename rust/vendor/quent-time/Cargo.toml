@@ -1,0 +1,16 @@
+[package]
+name = "quent-time"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+ts = ["dep:serde", "dep:ts-rs"]
+__test-clock-override = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+thiserror = "2"
+ts-rs = { version = "12", optional = true }
+

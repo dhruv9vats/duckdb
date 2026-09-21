@@ -756,3 +756,27 @@ Storage telemetry is fail-open. The storage layer depends only on probe
 abstractions; generated Quent types stay in the main telemetry layer. Custom
 `DBConfig.buffer_manager` implementations bypass temporary I/O and all three
 memory gauges.
+
+## Browser capture semantics
+
+The browser producer sends ordered postcard batches to a separate analyzer
+worker. Sequence numbers, revisions, watermarks, and nanosecond timestamps are
+decimal strings at the JavaScript boundary. This preserves values above
+`Number.MAX_SAFE_INTEGER`.
+
+The analyzer publishes an immutable revision only after seal validation. The
+SQL result may arrive earlier; only its telemetry remains unpublished.
+A missing batch, regressed watermark, contract mismatch, size breach, dropped
+event, cancellation timeout, or worker failure makes the capture incomplete or
+overflowed. It must not be silently upgraded by a late seal.
+
+Current limits are 4 MiB per batch and 64 MiB per capture and encoded session.
+Each immutable revision replays the whole bounded session. Retained revisions
+use a 512 MiB estimated snapshot budget at ten times encoded source bytes; this
+is not a hard allocator or RSS cap. Eight revisions is an upper bound, not a
+promise. A budget breach requires reset. Browser execution is single-threaded
+and does not report spill I/O. Reset clears analyzer history; after forced
+cancellation it also recreates the DuckDB worker and database.
+
+The configured SQL row limit applies only to result serialization. The engine
+materializes the result first, so this limit does not bound query memory.

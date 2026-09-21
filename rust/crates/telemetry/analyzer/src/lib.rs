@@ -1,12 +1,15 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+#[cfg(feature = "native-io")]
+use duckdb_telemetry_store::DuckDb;
 use duckdb_telemetry_store::{
-    ChunkTransferEvent, DuckDb, DuckDbEvent, MemoryAccountEvent, OperatorInvocationEvent,
+    ChunkTransferEvent, DuckDbEvent, MemoryAccountEvent, OperatorInvocationEvent,
     PipelineTaskEvent, TemporaryBlockIoEvent,
 };
+#[cfg(feature = "native-io")]
+use quent_analyzer::context::ContextInventory;
 use quent_analyzer::{
     AnalyzerError, AnalyzerResult, Entity, RefTreeEntity, Span,
-    context::ContextInventory,
     fsm::{
         FsmUsages, Transition,
         native::{AnalyzedTransition, TransitionEvent},
@@ -23,7 +26,9 @@ use quent_dynamic_attributes::DynamicAttribute;
 use quent_events::Event;
 pub use quent_query_engine_analyzer::QueryEngineModel;
 use quent_query_engine_analyzer::entities;
-use quent_query_engine_analyzer::ui::{QuentViewer, UiAnalyzer, ViewerEventStream};
+use quent_query_engine_analyzer::ui::UiAnalyzer;
+#[cfg(feature = "native-io")]
+use quent_query_engine_analyzer::ui::{QuentViewer, ViewerEventStream};
 use quent_query_engine_analyzer::{
     EngineEntity, OperatorEntity, PlanEntity, PortEntity, QueryEntity, QueryGroupEntity,
     WorkerEntity,
@@ -31,6 +36,7 @@ use quent_query_engine_analyzer::{
 use quent_query_engine_ui::{
     DataFlowTimelineBinned, EntityRef, OperatorFilter, QueryBundle, QueryEntities, QueryFilter,
 };
+#[cfg(feature = "native-io")]
 use quent_store::event::{EntityEventStore, ModelEventStore, filesystem::Store};
 use quent_time::{
     TimeNanoSec, TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec, to_nanosecs, to_secs,
@@ -64,7 +70,7 @@ use uuid::Uuid;
 
 use crate::{
     chunk_transfer::{ChunkTransfer, ChunkTransferExt},
-    memory_account::{MemoryAccount, MemoryAccountExt},
+    memory_account::{MemoryAccount, MemoryAccountExt, MemoryTransition},
     model::{
         DuckDbModel, DuckDbModelBuilder, IO_BUFFER_BYTES_CAPACITY_NAME,
         IO_OPERATIONS_CAPACITY_NAME, MEMORY_BYTES_CAPACITY_NAME,
@@ -89,17 +95,27 @@ const CHUNK_TRANSFER_TYPE_NAME: &str = "chunk_transfer";
 const OPERATOR_INVOCATION_TYPE_NAME: &str = "operator_invocation";
 const TEMPORARY_BLOCK_IO_TYPE_NAME: &str = "temporary_block_io";
 const MEMORY_ACCOUNT_TYPE_NAME: &str = "memory_account";
+const ENTITY_TYPE_NAMES: [&str; 5] = [
+    PIPELINE_TASK_TYPE_NAME,
+    CHUNK_TRANSFER_TYPE_NAME,
+    OPERATOR_INVOCATION_TYPE_NAME,
+    TEMPORARY_BLOCK_IO_TYPE_NAME,
+    MEMORY_ACCOUNT_TYPE_NAME,
+];
 const MEASURE_CHUNKS: &str = "chunks";
 const MEASURE_ROWS: &str = "rows";
 const MEASURE_LOGICAL_BYTES: &str = "logical_bytes";
 const DATA_FLOW_STATE: &str = "published";
 const MEMORY_UPDATES_TOTAL_ATTR: &str = "accounted_updates_total";
 const MEMORY_UPDATES_OMITTED_ATTR: &str = "accounted_updates_omitted";
+const SNAPSHOT_BOUNDED_ATTR: &str = "snapshot_bounded";
+const SNAPSHOT_WATERMARK_ATTR: &str = "snapshot_watermark_unix_ns";
 const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
 
 /// `quent-open` entry point for DuckDB telemetry directories.
 pub struct Viewer;
 
+#[cfg(feature = "native-io")]
 impl QuentViewer for Viewer {
     type Analyzer = DuckDbUiAnalyzer;
 
@@ -147,6 +163,7 @@ impl QuentViewer for Viewer {
     }
 }
 
+#[cfg(feature = "native-io")]
 fn context_location(dir: &std::path::Path) -> quent_io::ImporterResult<(Uuid, &std::path::Path)> {
     let invalid = || {
         quent_io::ImporterError::other(std::io::Error::new(
@@ -189,8 +206,33 @@ enum UsageDetail {
     ResourceOnly,
 }
 
+trait UiTransition<T: UiTransitionEvent>: Transition + Timestamp {
+    fn data(&self) -> &T;
+    fn analyzed_usages(&self) -> &[quent_analyzer::resource::AnalyzedUsage];
+}
+
+impl<T: UiTransitionEvent> UiTransition<T> for AnalyzedTransition<T> {
+    fn data(&self) -> &T {
+        &self.data
+    }
+
+    fn analyzed_usages(&self) -> &[quent_analyzer::resource::AnalyzedUsage] {
+        self.usages()
+    }
+}
+
+impl UiTransition<MemoryAccountEvent> for MemoryTransition {
+    fn data(&self) -> &MemoryAccountEvent {
+        &self.data
+    }
+
+    fn analyzed_usages(&self) -> &[quent_analyzer::resource::AnalyzedUsage] {
+        self.usages()
+    }
+}
+
 fn transition_to_ui<T: UiTransitionEvent>(
-    transition: &AnalyzedTransition<T>,
+    transition: &impl UiTransition<T>,
     epoch: TimeUnixNanoSec,
     clip: Option<SpanUnixNanoSec>,
     usage_detail: UsageDetail,
@@ -202,7 +244,7 @@ fn transition_to_ui<T: UiTransitionEvent>(
     Ok(FsmTransition {
         name: transition.name().to_owned(),
         usages: transition
-            .usages()
+            .analyzed_usages()
             .iter()
             .map(|usage| FsmUsage {
                 resource: usage.resource_id,
@@ -217,7 +259,7 @@ fn transition_to_ui<T: UiTransitionEvent>(
             })
             .collect(),
         timestamp: try_to_secs_relative(timestamp, epoch)?,
-        attributes: transition.data.ui_attributes(),
+        attributes: transition.data().ui_attributes(),
         derived_attributes: vec![],
     })
 }
@@ -418,7 +460,7 @@ impl ToUiFsm for MemoryAccount {
         let registered = transitions.first().ok_or_else(|| {
             AnalyzerError::IncompleteEntity(format!("memory account {} is empty", self.id()))
         })?;
-        let exited = transitions.last().ok_or_else(|| {
+        let last = transitions.last().ok_or_else(|| {
             AnalyzerError::IncompleteEntity(format!("memory account {} is empty", self.id()))
         })?;
         let MemoryAccountEvent::AccountRegistered { instance_name, .. } = &registered.data else {
@@ -427,13 +469,6 @@ impl ToUiFsm for MemoryAccount {
                 self.id()
             )));
         };
-        if !matches!(exited.data, MemoryAccountEvent::Exit { .. }) {
-            return Err(AnalyzerError::IncompleteEntity(format!(
-                "memory account {} has no exit",
-                self.id()
-            )));
-        }
-
         let mut updates = transitions
             .iter()
             .filter(|transition| matches!(transition.data, MemoryAccountEvent::Accounted { .. }));
@@ -458,16 +493,28 @@ impl ToUiFsm for MemoryAccount {
             DynamicAttribute::u64(MEMORY_UPDATES_TOTAL_ATTR, total as u64),
             DynamicAttribute::u64(MEMORY_UPDATES_OMITTED_ATTR, (total - 1) as u64),
         ];
+        if let Some(watermark) = self.snapshot_bound() {
+            accounted
+                .derived_attributes
+                .push(DynamicAttribute::u8(SNAPSHOT_BOUNDED_ATTR, 1));
+            accounted
+                .derived_attributes
+                .push(DynamicAttribute::u64(SNAPSHOT_WATERMARK_ATTR, watermark));
+        }
+
+        let mut compact = vec![
+            transition_to_ui(registered, epoch, clip, UsageDetail::Exact)?,
+            accounted,
+        ];
+        if matches!(last.data, MemoryAccountEvent::Exit { .. }) {
+            compact.push(transition_to_ui(last, epoch, clip, UsageDetail::Exact)?);
+        }
 
         Ok(FiniteStateMachine {
             id: self.id(),
             type_name: self.type_name().to_owned(),
             instance_name: instance_name.clone(),
-            transitions: vec![
-                transition_to_ui(registered, epoch, clip, UsageDetail::Exact)?,
-                accounted,
-                transition_to_ui(exited, epoch, clip, UsageDetail::Exact)?,
-            ],
+            transitions: compact,
         })
     }
 }
@@ -632,23 +679,7 @@ impl UiAnalyzer for DuckDbUiAnalyzer {
             resources = model.runtime_resources.len(),
             "built DuckDB query-engine model"
         );
-        let mut analyzer = Self {
-            model,
-            query_topologies: FxHashMap::default(),
-            query_tasks: FxHashMap::default(),
-        };
-        let query_ids = analyzer
-            .model
-            .queries()
-            .map(Entity::id)
-            .collect::<SmallVec<[Uuid; 4]>>();
-        for query_id in query_ids {
-            let topology = analyzer.build_query_topology(query_id)?;
-            let tasks = analyzer.build_query_tasks(query_id, &topology);
-            analyzer.query_topologies.insert(query_id, topology);
-            analyzer.query_tasks.insert(query_id, tasks);
-        }
-        Ok(analyzer)
+        Self::from_model(model)
     }
 
     fn extract_engine(
@@ -840,24 +871,22 @@ impl UiAnalyzer for DuckDbUiAnalyzer {
             .map(|scope| scope.resolve(&self.model))
             .transpose()?;
         let filter = entry.application;
+        let all_types = entry.filter.entity_type_name.is_none() && scope.is_none();
+        let page = entry.page;
+        let type_page = page.map(|page| quent_ui::paginate::PageParams {
+            page: 0,
+            max: page.page.saturating_add(1).saturating_mul(page.max),
+        });
         let query = entities::ListQuery {
             scope: scope.as_ref(),
             window,
             filter: &entry.filter,
             sort: entry.sort,
-            page: entry.page,
+            page: if all_types { type_page } else { page },
             epoch,
         };
 
-        // The Quent long-entities row omits the entity type; default it from
-        // the scoped resource so each resource lists its own entities (e.g.
-        // memory resources list memory accounts).
-        let entity_type = match entry.filter.entity_type_name.as_deref() {
-            Some(name) => name.to_owned(),
-            None => self.default_scope_entity_type(scope.as_ref()),
-        };
-
-        match entity_type.as_str() {
+        let list_type = |entity_type: &str| match entity_type {
             PIPELINE_TASK_TYPE_NAME => list_fsms(
                 self.model.pipeline_tasks_for(query_id),
                 |task| {
@@ -929,7 +958,45 @@ impl UiAnalyzer for DuckDbUiAnalyzer {
             other => Err(AnalyzerError::InvalidArgument(format!(
                 "unknown DuckDB entity type {other:?}"
             ))),
+        };
+
+        if !all_types {
+            // Scoped long-entity rows omit the type and use the resource's FSM.
+            let entity_type = entry
+                .filter
+                .entity_type_name
+                .as_deref()
+                .map(str::to_owned)
+                .unwrap_or_else(|| self.default_scope_entity_type(scope.as_ref()));
+            return list_type(&entity_type);
         }
+
+        // The top-level "All types" view is one globally ranked result set.
+        let mut items = Vec::new();
+        let mut total = 0_u32;
+        for entity_type in ENTITY_TYPE_NAMES {
+            let response = list_type(entity_type)?;
+            total = total.saturating_add(response.total);
+            items.extend(response.items);
+        }
+        items.sort_by(|a, b| {
+            let ordering = a.usage_duration_s.total_cmp(&b.usage_duration_s);
+            let ordering = match query.sort.dir {
+                SortDir::Asc => ordering,
+                SortDir::Desc => ordering.reverse(),
+            };
+            ordering.then_with(|| a.entity.id.cmp(&b.entity.id))
+        });
+
+        if let Some(page) = page {
+            items = items
+                .into_iter()
+                .skip(page.page.saturating_mul(page.max) as usize)
+                .take(page.max as usize)
+                .collect();
+        }
+
+        Ok(EntityListResponse { items, total })
     }
 
     fn data_flow_timeline(
@@ -1095,6 +1162,47 @@ impl UiAnalyzer for DuckDbUiAnalyzer {
 }
 
 impl DuckDbUiAnalyzer {
+    /// Build an immutable browser snapshot bounded by an acknowledged watermark.
+    pub fn try_new_snapshot(
+        engine_id: Uuid,
+        events: impl Iterator<Item = Event<DuckDbEvent>>,
+        watermark: TimeUnixNanoSec,
+    ) -> AnalyzerResult<Self> {
+        let mut builder = DuckDbModelBuilder::try_new(engine_id)?;
+        for event in events {
+            if event.timestamp > watermark {
+                return Err(AnalyzerError::Validation(format!(
+                    "event timestamp {} exceeds snapshot watermark {watermark}",
+                    event.timestamp
+                )));
+            }
+            builder.try_push(event)?;
+        }
+
+        Self::from_model(builder.try_build_snapshot(watermark)?)
+    }
+
+    fn from_model(model: DuckDbModel) -> AnalyzerResult<Self> {
+        let mut analyzer = Self {
+            model,
+            query_topologies: FxHashMap::default(),
+            query_tasks: FxHashMap::default(),
+        };
+        let query_ids = analyzer
+            .model
+            .queries()
+            .map(Entity::id)
+            .collect::<SmallVec<[Uuid; 4]>>();
+        for query_id in query_ids {
+            let topology = analyzer.build_query_topology(query_id)?;
+            let tasks = analyzer.build_query_tasks(query_id, &topology);
+            analyzer.query_topologies.insert(query_id, topology);
+            analyzer.query_tasks.insert(query_id, tasks);
+        }
+
+        Ok(analyzer)
+    }
+
     fn build_single_timeline(
         &self,
         request: SingleTimelineRequest<QueryFilter, OperatorFilter>,
@@ -1608,6 +1716,7 @@ mod schema_tests {
     use quent_ui::entities::request::{
         EntityListEntry, EntityListFilter, EntityScope, EntitySortKey, Sort, SortDir, TimeWindow,
     };
+    use quent_ui::paginate::PageParams;
     use quent_ui::timeline::request::{
         EntityFilter, ResourceGroupTimelineRequest, ResourceTimelineRequest, TimelineConfig,
     };
@@ -1659,7 +1768,7 @@ mod schema_tests {
         Event::new(id, timestamp, data.into())
     }
 
-    fn fixture() -> DuckDbUiAnalyzer {
+    fn fixture_events() -> Vec<Event<schema::DuckDbEvent>> {
         let unit = schema::ExecutionThreadUsage;
         let queue_usage = schema::TaskQueueUsage { entries: 1 };
         let mut events = vec![
@@ -2037,7 +2146,11 @@ mod schema_tests {
         }
         events.sort_by_key(|event| event.timestamp);
 
-        DuckDbUiAnalyzer::try_new(ENGINE_ID, events.into_iter()).unwrap()
+        events
+    }
+
+    fn fixture() -> DuckDbUiAnalyzer {
+        DuckDbUiAnalyzer::try_new(ENGINE_ID, fixture_events().into_iter()).unwrap()
     }
 
     fn list_request(
@@ -2289,6 +2402,55 @@ mod schema_tests {
     }
 
     #[test]
+    fn snapshot_keeps_open_memory_without_exit() {
+        let mut builder = DuckDbModelBuilder::try_new(ENGINE_ID).unwrap();
+        builder.try_push(engine_init()).unwrap();
+        builder
+            .try_push(Event::new(
+                ACCOUNT_ID,
+                2,
+                schema::MemoryAccountEvent::AccountRegistered {
+                    seq: 0,
+                    instance_name: "hash table".to_owned(),
+                    engine_id: EntityRef::<schema::Engine>::new(ENGINE_ID, ()),
+                    memory_tag: "HASH_TABLE".to_owned(),
+                }
+                .into(),
+            ))
+            .unwrap();
+        builder
+            .try_push(Event::new(
+                ACCOUNT_ID,
+                3,
+                schema::MemoryAccountEvent::Accounted {
+                    seq: 1,
+                    buffer_pool: Some(EntityRef::<schema::BufferPoolMemory, _>::new(
+                        RESOURCE_ID,
+                        schema::BufferPoolMemoryUsage { bytes: 32 },
+                    )),
+                    temporary_storage: None,
+                    temporary_directory: None,
+                }
+                .into(),
+            ))
+            .unwrap();
+
+        let model = builder.try_build_snapshot(7).unwrap();
+        let account = &model.memory_accounts[&ACCOUNT_ID];
+
+        assert!(account.is_snapshot_bounded());
+        assert_eq!(account.latest_timestamp(), 7);
+        assert_eq!(account.transitions().len(), 2);
+        assert!(
+            !account.transitions().iter().any(|transition| matches!(
+                transition.data,
+                schema::MemoryAccountEvent::Exit { .. }
+            ))
+        );
+        assert_eq!(account.usages().next().unwrap().span().end(), 7);
+    }
+
+    #[test]
     fn query_view_resolves_resources() {
         use quent_analyzer::Model as _;
 
@@ -2460,6 +2622,72 @@ mod schema_tests {
     }
 
     #[test]
+    fn unscoped_entities_merge_types_before_paging() {
+        let analyzer = fixture();
+        let all = analyzer
+            .list_entities(list_request(None, None, vec![]))
+            .unwrap();
+        let types = all
+            .items
+            .iter()
+            .map(|item| item.entity.type_name.as_str())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(types.len(), 5);
+        assert!(
+            all.items
+                .windows(2)
+                .all(|items| items[0].usage_duration_s >= items[1].usage_duration_s)
+        );
+
+        let mut first_request = list_request(None, None, vec![]);
+        first_request.entry.page = Some(PageParams { page: 0, max: 2 });
+        let first = analyzer.list_entities(first_request).unwrap();
+        let mut second_request = list_request(None, None, vec![]);
+        second_request.entry.page = Some(PageParams { page: 1, max: 2 });
+        let second = analyzer.list_entities(second_request).unwrap();
+        let paged_ids = first
+            .items
+            .iter()
+            .chain(&second.items)
+            .map(|item| item.entity.id)
+            .collect::<Vec<_>>();
+        let expected_ids = all
+            .items
+            .iter()
+            .take(4)
+            .map(|item| item.entity.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(first.total, all.total);
+        assert_eq!(second.total, all.total);
+        assert_eq!(paged_ids, expected_ids);
+
+        let filtered = analyzer
+            .list_entities(list_request(None, None, vec![SOURCE_ID]))
+            .unwrap();
+        let filtered_ids = filtered
+            .items
+            .iter()
+            .map(|item| (item.entity.type_name.clone(), item.entity.id))
+            .collect::<HashSet<_>>();
+        let mut expected_filtered_ids = HashSet::new();
+        for entity_type in ENTITY_TYPE_NAMES {
+            let response = analyzer
+                .list_entities(list_request(Some(entity_type), None, vec![SOURCE_ID]))
+                .unwrap();
+            expected_filtered_ids.extend(
+                response
+                    .items
+                    .into_iter()
+                    .map(|item| (item.entity.type_name, item.entity.id)),
+            );
+        }
+
+        assert_eq!(filtered_ids, expected_filtered_ids);
+    }
+
+    #[test]
     fn task_and_invocation_timelines_match_observed_spans() {
         let analyzer = fixture();
         let task_response = analyzer
@@ -2576,6 +2804,31 @@ mod schema_tests {
             !filtered
                 .capacities_values
                 .contains_key(MEMORY_BYTES_CAPACITY_NAME)
+        );
+    }
+
+    #[test]
+    fn open_memory_snapshot_preserves_query_timeline() {
+        let expected = fixture()
+            .single_resource_timeline(timeline_request(RESOURCE_ID, None, vec![], full_config()))
+            .unwrap();
+        let mut events = fixture_events();
+        events.retain(|event| {
+            !matches!(
+                event.data,
+                schema::DuckDbEvent::MemoryAccount(schema::MemoryAccountEvent::Exit { .. })
+            )
+        });
+        let snapshot =
+            DuckDbUiAnalyzer::try_new_snapshot(ENGINE_ID, events.into_iter(), 11 * ONE_SECOND_NS)
+                .unwrap();
+        let actual = snapshot
+            .single_resource_timeline(timeline_request(RESOURCE_ID, None, vec![], full_config()))
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
         );
     }
 

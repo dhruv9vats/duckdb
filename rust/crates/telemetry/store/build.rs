@@ -18,6 +18,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Options::default()
         },
     )?;
+    if std::env::var_os("CARGO_FEATURE_NATIVE_IO").is_none() {
+        let source = std::fs::read_to_string(&generated.path)?;
+        let portable = source.replacen(
+            "impl ::quent_store::event::filesystem::Model for DuckDb",
+            "#[cfg(feature = \"native-io\")]\nimpl ::quent_store::event::filesystem::Model for DuckDb",
+            1,
+        );
+        if portable == source {
+            return Err("generated DuckDb filesystem model was not found".into());
+        }
+        std::fs::write(&generated.path, portable)?;
+    }
     for warning in generated.warnings {
         println!("cargo:warning={warning}");
     }

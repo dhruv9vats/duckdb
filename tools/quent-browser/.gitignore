@@ -1,0 +1,9 @@
+node_modules/
+.pnpm-store/
+.quent/
+dist/
+/public/build-manifest.json
+test-results/
+playwright-report/
+public/wasm/
+.build/

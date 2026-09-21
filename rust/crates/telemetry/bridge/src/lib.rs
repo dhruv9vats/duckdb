@@ -2,3 +2,6 @@
 mod bridge {
     include!(concat!(env!("OUT_DIR"), "/bridge_mod.rs"));
 }
+
+#[cfg(feature = "browser")]
+mod browser;

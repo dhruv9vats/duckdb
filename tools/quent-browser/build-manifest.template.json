@@ -1,0 +1,9 @@
+{
+  "protocol_version": 1,
+  "producer_worker_url": "workers/duckdb-browser.worker.js",
+  "duckdb_module_js_url": "wasm/duckdb-browser.js",
+  "duckdb_wasm_url": "wasm/duckdb-browser.wasm",
+  "analyzer_worker_url": "workers/duckdb-telemetry.worker.js",
+  "analyzer_wasm_js_url": "wasm/duckdb_telemetry_web.js",
+  "analyzer_wasm_url": "wasm/duckdb_telemetry_web_bg.wasm"
+}

@@ -11,6 +11,7 @@
 #include "duckdb/common/shared_ptr.hpp"
 
 #include <cstdint>
+#include <vector>
 
 namespace duckdb {
 
@@ -27,6 +28,16 @@ enum class TaskExecutionMode : uint8_t;
 
 enum class TelemetryTaskOutcome : uint8_t { SUCCESS, FAILURE };
 enum class TelemetryOperatorPhase : uint8_t { SOURCE, EXECUTE, FINAL_EXECUTE, SINK };
+enum class BrowserTelemetryStatus : uint8_t { UNAVAILABLE, READY, FAILED };
+
+struct BrowserTelemetryBatch {
+	std::vector<uint8_t> payload;
+	uint32_t event_count;
+	uint64_t min_timestamp;
+	uint64_t max_timestamp;
+	uint64_t dropped_events;
+	BrowserTelemetryStatus status;
+};
 
 class TelemetryContext {
 public:
@@ -36,6 +47,11 @@ public:
 	void Initialize(ClientContext &context);
 	shared_ptr<TemporaryIoProbe> TempIoProbe();
 	shared_ptr<duckdb::MemoryUsageProbe> MemoryUsageProbe();
+	BrowserTelemetryBatch DrainBrowserEvents(uint64_t max_bytes);
+	vector<string> BrowserTelemetryQueryIds();
+	string BrowserTelemetryContextId();
+	uint64_t BrowserTelemetryWatermark();
+	bool BeginBrowserTelemetryRun();
 	static void StartExecution(ClientContext &context, const PhysicalOperator &root);
 #ifdef DUCKDB_QUENT_TELEMETRY
 	static void PipelineTaskCreated(ClientContext &context, const PipelineTask &task, const Pipeline &pipeline);

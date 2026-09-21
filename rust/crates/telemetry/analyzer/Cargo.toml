@@ -3,18 +3,29 @@ name = "duckdb-telemetry-analyzer"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["native-io"]
+native-io = [
+    "dep:quent-io",
+    "dep:quent-store",
+    "duckdb-telemetry-store/native-io",
+]
+
 [dependencies]
-duckdb-telemetry-store = { path = "../store" }
+duckdb-telemetry-store = { path = "../store", default-features = false }
 quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
 quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
 quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
-quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
+quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", optional = true }
 quent-query-engine-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
 quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
-quent-store = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", features = ["io-msgpack", "io-ndjson", "io-postcard"] }
+quent-store = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", features = ["io-msgpack", "io-ndjson", "io-postcard"], optional = true }
 quent-time = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
 quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
 rustc-hash = "2"
 smallvec = "1"
 tracing = "0.1"
 uuid = "1"
+
+[dev-dependencies]
+serde_json = "1"

@@ -3,10 +3,14 @@ name = "duckdb-telemetry-store"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["native-io"]
+native-io = ["quent-store/io-msgpack", "quent-store/io-ndjson", "quent-store/io-postcard"]
+
 [dependencies]
 quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a" }
 quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", features = ["serde"] }
-quent-store = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", features = ["io-msgpack", "io-ndjson", "io-postcard"] }
+quent-store = { git = "https://github.com/rapidsai/quent.git", rev = "4a091722f1a5b7a93e5883b82b838eea43f28c3a", default-features = false }
 serde = { version = "1", features = ["derive"] }
 smallvec = "1"
 

@@ -755,7 +755,11 @@ impl DuckDbModelBuilder {
                 Ok(())
             }
             schema::DuckDbEvent::MemoryAccount(data) => {
-                Self::push_fsm(&mut self.memory_accounts, Event::new(id, timestamp, data))?;
+                let builder = match self.memory_accounts.entry(id) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => entry.insert(MemoryAccountBuilder::try_new(id)?),
+                };
+                builder.push_transition(Event::new(id, timestamp, data));
                 Ok(())
             }
             schema::DuckDbEvent::ExecutionThread(data) => {
@@ -904,6 +908,17 @@ impl DuckDbModelBuilder {
     }
 
     pub(crate) fn try_build(self) -> AnalyzerResult<DuckDbModel> {
+        self.build(None)
+    }
+
+    pub(crate) fn try_build_snapshot(
+        self,
+        watermark: TimeUnixNanoSec,
+    ) -> AnalyzerResult<DuckDbModel> {
+        self.build(Some(watermark))
+    }
+
+    fn build(self, snapshot_watermark: Option<TimeUnixNanoSec>) -> AnalyzerResult<DuckDbModel> {
         let engine = self.engine.ok_or_else(|| {
             AnalyzerError::IncompleteEntity(format!("engine {} has no events", self.engine_id))
         })?;
@@ -928,11 +943,18 @@ impl DuckDbModelBuilder {
             TemporaryBlockIo::try_from_builder,
             "temporary block I/O",
         )?;
-        let memory_accounts = build_fsms(
-            self.memory_accounts,
-            MemoryAccount::try_from_builder,
-            "memory account",
-        )?;
+        let memory_accounts = match snapshot_watermark {
+            Some(watermark) => build_fsms(
+                self.memory_accounts,
+                |builder| MemoryAccount::try_from_snapshot(builder, watermark),
+                "memory account",
+            )?,
+            None => build_fsms(
+                self.memory_accounts,
+                MemoryAccount::try_from_builder,
+                "memory account",
+            )?,
+        };
 
         let runtime_resources = build_resources(self.resources)?;
         let mut resource_types = resource_types();
@@ -1100,14 +1122,11 @@ fn build_resource(
     Ok(Some(resource))
 }
 
-fn build_fsms<T, U>(
-    builders: HashMap<Uuid, AnalyzedFsmBuilder<T>>,
-    build: fn(AnalyzedFsmBuilder<T>) -> AnalyzerResult<U>,
+fn build_fsms<B, U>(
+    builders: HashMap<Uuid, B>,
+    build: impl Fn(B) -> AnalyzerResult<U>,
     name: &str,
-) -> AnalyzerResult<HashMap<Uuid, U>>
-where
-    T: quent_analyzer::fsm::native::TransitionEvent,
-{
+) -> AnalyzerResult<HashMap<Uuid, U>> {
     let mut fsms = HashMap::default();
     for (id, builder) in builders {
         match build(builder) {

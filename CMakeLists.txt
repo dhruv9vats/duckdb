@@ -584,6 +584,9 @@ option(BUILD_MAIN_DUCKDB_LIBRARY
 option(BUILD_QUENT_TELEMETRY
        "Build and link the experimental Quent telemetry bridge."
        TRUE)
+option(BUILD_QUENT_BROWSER_TELEMETRY
+       "Enable the browser-only Quent in-memory telemetry exporter."
+       FALSE)
 option(BUILD_EXTENSIONS_ONLY "Build all extension as linkable, overriding DONT_LINK, and don't build core." FALSE)
 option(BUILD_BENCHMARKS "Enable building of the benchmark suite." FALSE)
 option(DISABLE_BUILTIN_EXTENSIONS "Disable linking extensions." FALSE)
@@ -1107,6 +1110,9 @@ elseif (BUILD_MAIN_DUCKDB_LIBRARY)
     target_compile_features(duckdb_main PRIVATE cxx_std_20)
     target_compile_definitions(duckdb_main PRIVATE DUCKDB_QUENT_TELEMETRY)
     target_compile_definitions(duckdb_parallel PRIVATE DUCKDB_QUENT_TELEMETRY)
+    if(EMSCRIPTEN AND BUILD_QUENT_BROWSER_TELEMETRY)
+      target_compile_definitions(duckdb_main PRIVATE DUCKDB_QUENT_BROWSER_TELEMETRY)
+    endif()
   endif()
 
   add_subdirectory(tools)

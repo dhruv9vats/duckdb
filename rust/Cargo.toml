@@ -6,7 +6,9 @@ members = [
     "crates/telemetry/model",
     "crates/telemetry/server",
     "crates/telemetry/store",
+    "crates/telemetry/web",
 ]
+exclude = ["vendor/quent-query-engine-analyzer", "vendor/quent-time"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,3 +19,9 @@ edition = "2024"
 # workspace lockfile resolve them together.
 cxx = "1"
 cxx-build = "1"
+
+[patch."https://github.com/rapidsai/quent.git"]
+# Pinned 4a09172 source with its quent-io defaults disabled for WASM.
+quent-query-engine-analyzer = { path = "vendor/quent-query-engine-analyzer" }
+quent-time = { path = "vendor/quent-time" }
+quent-instrumentation = { path = "vendor/quent-instrumentation" }

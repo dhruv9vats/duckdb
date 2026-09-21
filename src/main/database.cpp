@@ -295,6 +295,26 @@ static duckdb_ext_api_v1 CreateAPIv1Wrapper() {
 	return CreateAPIv1();
 }
 
+BrowserTelemetryBatch DatabaseInstance::DrainBrowserEvents(uint64_t max_bytes) {
+	return telemetry_context->DrainBrowserEvents(max_bytes);
+}
+
+vector<string> DatabaseInstance::BrowserTelemetryQueryIds() {
+	return telemetry_context->BrowserTelemetryQueryIds();
+}
+
+string DatabaseInstance::BrowserTelemetryContextId() {
+	return telemetry_context->BrowserTelemetryContextId();
+}
+
+uint64_t DatabaseInstance::BrowserTelemetryWatermark() {
+	return telemetry_context->BrowserTelemetryWatermark();
+}
+
+bool DatabaseInstance::BeginBrowserTelemetryRun() {
+	return telemetry_context->BeginBrowserTelemetryRun();
+}
+
 void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_config) {
 	DBConfig default_config;
 	DBConfig *config_ptr = &default_config;

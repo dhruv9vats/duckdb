@@ -225,3 +225,64 @@ For every schema edit:
 7. Run native and Rust formatting.
 8. Re-run the actual service and UI validation.
 9. Update human semantics and this file separately.
+
+## Browser maintenance
+
+The browser application lives in `tools/quent-browser`. The worker wire
+contract is `crates/telemetry/web/protocol-v1.json`; change that fixture, both
+workers, and the TypeScript worker protocol together. All u64 values on that
+wire are decimal strings. Analyzer responses use Quent's lossless JSON parser.
+
+`tools/quent-browser/iframe/protocol.ts` separately owns the parent/iframe
+contract. The child sends `quent-connect`; after source/origin validation the
+parent sends a new port with `quent-port`. The child sends `ready` and receives
+snapshots containing a string revision plus optional capture, engine, and
+last-query IDs. RPC uses `rpc`, `rpc-result`, and `rpc-error`. The parent
+allowlists `ApiClient` methods and rejects stale revisions before and after
+dispatch. Structured clone preserves BigInt.
+Do not add an HTTP API, global `fetch` patch, or duplicate protocol types.
+
+Quent is pinned to `4a091722f1a5b7a93e5883b82b838eea43f28c3a` and built from
+source by `scripts/prepare-quent.sh`. Do not replace its API transport by
+patching global `fetch`. The build manifest binds protocol, schema, build ID,
+and asset URLs. `scripts/stamp-manifest.mjs` derives schema/build identity and
+hashes every worker and WASM asset from `build-manifest.template.json`. The
+generated public manifest is ignored; real mode rejects an unstamped manifest.
+
+Run the browser gates in this order:
+
+```bash
+cd tools/quent-browser
+bash scripts/prepare-quent.sh
+pnpm install --frozen-lockfile
+pnpm analyzer:build
+bash scripts/build-producer.sh
+pnpm test
+pnpm build
+QUENT_REAL_ANALYZER=1 QUENT_REAL_PRODUCER=1 pnpm test:e2e
+```
+
+`pnpm build` must produce both `dist/index.html` and
+`dist/iframe/index.html`; raw `vite build` is not a release build. Both Vite
+bases are relative and Quent uses hash routes, so `dist` works at `/duckdb/`.
+Pushes to `quent` deploy after all gates. Manual runs deploy only when the ref
+is `quent` and `deploy=true`. Pages must use the GitHub Actions source, and the
+`github-pages` environment must allow only `quent`.
+
+Analyzer revisions replay all accepted session batches. Admission limits are
+64 MiB encoded session bytes and 512 MiB estimated retained snapshots. The
+snapshot estimate is ten times each revision's cumulative encoded source; it
+is not an allocator or RSS bound. `max_history = 8` is only an upper bound.
+`SESSION_LIMIT` or `SNAPSHOT_LIMIT` requires a user reset.
+
+The producer is a custom Emscripten module with a narrow C ABI, not the
+upstream `duckdb-wasm` JavaScript wrapper. The page relays transferred batches
+between workers. The parent/iframe channel carries API calls and responses,
+not captures. Captures and revisions remain memory-only; browser builds disable
+Copy Link because it cannot reproduce them after a full-page reload.
+NVTX calls return no data and browser spill telemetry remains unsupported.
+
+On 2026-09-21 the latest native analyzer service replayed a fresh 250,000-row
+group/window capture. Engines, contexts, query groups, queries, bundles,
+entities, single and bulk timelines, and data flow returned HTTP 200; operator
+and entity collections were nonempty. The entities response was 516,815 bytes.
