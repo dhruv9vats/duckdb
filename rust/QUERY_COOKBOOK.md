@@ -9,7 +9,6 @@ views. Run commands from the repository root. See
 Build DuckDB with telemetry enabled:
 
 ```bash
-cd /path/to/duckdb
 cmake -S . -B build/release \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_QUENT_TELEMETRY=ON
@@ -29,7 +28,6 @@ Every workload below assigns its capture directory to `events_dir`. After the
 DuckDB command exits, run this in the same shell:
 
 ```bash
-cd /path/to/duckdb
 cargo run --manifest-path rust/Cargo.toml \
     -p duckdb-telemetry-server --features ui -- \
     --output-dir "$events_dir" \
@@ -74,7 +72,6 @@ joins, blocking aggregation, two windows, ordering, chunk flow, and forced
 spill/reload in one target query.
 
 ```bash
-cd /path/to/duckdb
 DUCKDB_BIN=${DUCKDB_BIN:-build/release/duckdb}
 run_dir=$(mktemp -d /tmp/duckdb-quent-combined.XXXXXX)
 events_dir="$run_dir/events"
@@ -190,11 +187,8 @@ The target reads stored tables because DuckDB's `range()` table function is
 forced single-threaded.
 
 ```bash
-cd /path/to/duckdb
 DUCKDB_BIN=${DUCKDB_BIN:-build/release/duckdb}
-events_dir=$(mktemp -d /tmp/duckdb-quent-parallel.XXXXXX)
-
-QUENT_EXPORTER=ndjson \
+events_dir=telemetry_events/=ndjson \
 QUENT_OUTPUT_DIR="$events_dir" \
 "$DUCKDB_BIN" -c "
 SET threads=4;
@@ -249,10 +243,8 @@ Purpose:
 for ordinary performance measurements.
 
 ```bash
-cd /path/to/duckdb
 DUCKDB_BIN=${DUCKDB_BIN:-build/release/duckdb}
-events_dir=$(mktemp -d /tmp/duckdb-quent-spill.XXXXXX)
-spill_dir=$(mktemp -d /tmp/duckdb-spill.XXXXXX)
+events_dir=telemetry_events/mktemp -d /tmp/duckdb-spill.XXXXXX)
 
 QUENT_EXPORTER=ndjson \
 QUENT_OUTPUT_DIR="$events_dir" \
@@ -317,11 +309,8 @@ Purpose:
 The DuckDB command is expected to report a conversion error.
 
 ```bash
-cd /path/to/duckdb
 DUCKDB_BIN=${DUCKDB_BIN:-build/release/duckdb}
-events_dir=$(mktemp -d /tmp/duckdb-quent-failure.XXXXXX)
-
-QUENT_EXPORTER=ndjson \
+events_dir=telemetry_events/=ndjson \
 QUENT_OUTPUT_DIR="$events_dir" \
 "$DUCKDB_BIN" -c "
 SET threads=4;
@@ -375,10 +364,9 @@ Purpose:
 - task and chunk-flow timelines without intentionally forcing spill.
 
 ```bash
-cd /path/to/duckdb
 DUCKDB_BIN=${DUCKDB_BIN:-build/release/duckdb}
 tpch_root=${TPCH_ROOT:-/data/tpch/sf10/p16/snappy}
-events_dir=$(mktemp -d /tmp/duckdb-quent-tpch-q1.XXXXXX)
+events_dir=telemetry_events/
 
 QUENT_EXPORTER=ndjson \
 QUENT_OUTPUT_DIR="$events_dir" \
@@ -424,10 +412,9 @@ Purpose:
 - a nontrivial plan dataflow overlay.
 
 ```bash
-cd /path/to/duckdb
 DUCKDB_BIN=${DUCKDB_BIN:-build/release/duckdb}
 tpch_root=${TPCH_ROOT:-/data/tpch/sf10/p16/snappy}
-events_dir=$(mktemp -d /tmp/duckdb-quent-tpch-q9.XXXXXX)
+events_dir=telemetry_events/
 
 QUENT_EXPORTER=ndjson \
 QUENT_OUTPUT_DIR="$events_dir" \
@@ -521,10 +508,9 @@ aggregation, two windows, and forced external execution. Msgpack limits capture
 size and import overhead.
 
 ```bash
-cd /path/to/duckdb
 DUCKDB_BIN=${DUCKDB_BIN:-build/release/duckdb}
 tpch_root=${TPCH_ROOT:-/data/tpch/sf10/p16/snappy}
-events_dir=$(mktemp -d /tmp/duckdb-quent-tpch-all.XXXXXX)
+events_dir=telemetry_events/
 spill_dir=$(mktemp -d /tmp/duckdb-tpch-all-spill.XXXXXX)
 
 QUENT_EXPORTER=msgpack \

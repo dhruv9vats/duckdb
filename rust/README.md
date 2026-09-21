@@ -5,6 +5,8 @@ and serves the Quent UI.
 
 Human documentation:
 
+- [BROWSER_ARCHITECTURE.md](BROWSER_ARCHITECTURE.md): implemented browser stack,
+  correctness boundaries, feature extensions, testing, and deployment.
 - [INSTRUMENTATION.md](INSTRUMENTATION.md): event and resource semantics.
 - [QUERY_COOKBOOK.md](QUERY_COOKBOOK.md): capture and validation workloads.
 - [INSTRUMENTATION_CANDIDATES.md](INSTRUMENTATION_CANDIDATES.md): proposed
